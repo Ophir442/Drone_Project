@@ -1,0 +1,58 @@
+{
+	"world": {
+		"grid_width": 100,
+		"grid_height": 100,
+		"base_pos": { "x": 50.0, "y": 50.0 }
+	},
+
+	"simulation": {
+		"max_rounds": 50,
+		"priority_increment": 1.0
+	},
+
+	"algorithm": {
+		"grasp_iterations": 5,
+		"rcl_size": 3,
+		"thread_count": 4
+	},
+
+	"drones": [
+		{ "velocity": 5.0, "capacity": 15 },
+		{ "velocity": 7.0, "capacity": 10 },
+		{ "velocity": 5.0, "capacity": 15 },
+		{ "velocity": 6.0, "capacity": 12 },
+		{ "velocity": 5.0, "capacity": 15 }
+	],
+
+	"bakeries": [
+		{
+			"pos": { "x": 20.0, "y": 80.0 },
+			"capacity": 40,
+			"initial_inventory": 20,
+			"production_distribution": [[8, 0.6], [5, 0.4]]
+		},
+		{
+			"pos": { "x": 80.0, "y": 75.0 },
+			"capacity": 40,
+			"initial_inventory": 20,
+			"production_distribution": [[6, 0.5], [10, 0.5]]
+		},
+		{
+			"pos": { "x": 50.0, "y": 20.0 },
+			"capacity": 40,
+			"initial_inventory": 20,
+			"production_distribution": [[7, 0.7], [4, 0.3]]
+		}
+	],
+
+	"customers": [
+		{ "pos": { "x": 15.0, "y": 60.0 }, "order_quantity": 4 },
+		{ "pos": { "x": 35.0, "y": 85.0 }, "order_quantity": 6 },
+		{ "pos": { "x": 70.0, "y": 55.0 }, "order_quantity": 3 },
+		{ "pos": { "x": 85.0, "y": 35.0 }, "order_quantity": 5 },
+		{ "pos": { "x": 25.0, "y": 30.0 }, "order_quantity": 4 },
+		{ "pos": { "x": 60.0, "y": 15.0 }, "order_quantity": 7 },
+		{ "pos": { "x": 90.0, "y": 80.0 }, "order_quantity": 3 },
+		{ "pos": { "x": 40.0, "y": 50.0 }, "order_quantity": 5 }
+	]
+}
