@@ -7,8 +7,7 @@
 
 namespace {
 
-constexpr double kPriorityStarvationThreshold = 5.0;  ///< W_max trigger for spawning
-constexpr double kRepositionEpsilon           = 0.01; ///< "already there" threshold
+constexpr double kRepositionEpsilon = 0.01;  ///< "already there" threshold
 
 /// Expected value of a discrete distribution given as (amount, prob) pairs.
 double expected_value(const std::vector<std::pair<int, double>>& distribution) {
@@ -165,33 +164,26 @@ Drone Simulation::spawn_drone() {
 	return d;
 }
 
-/// Supply/demand spawning rule:
-///   B_supply > 0  AND  (D_demand > C_fleet  OR  W_max ≥ threshold)
-/// plus a hard cap `drones.size() < unassigned` so the fleet never outgrows demand.
+/// Organic supply/demand spawning: spawn iff bread exists to be moved AND
+/// the total fleet capacity is strictly less than total unassigned demand.
+/// The condition is self-bounding — the fleet stabilizes at exactly
+/// ceil(D_demand / drone.max_capacity) drones, so we need no headcount cap.
+/// Per-customer urgency is intentionally NOT considered here: priority_weight
+/// already steers the existing fleet through the GRASP score.
 bool Simulation::should_spawn_drone() const {
-	double D_demand    = 0.0;
-	double W_max       = 0.0;
-	int    unassigned  = 0;
+	double D_demand = 0.0;
 	for (const Customer& c : get_all_customers()) {
 		if (assigned_customer_ids.count(c.id)) continue;
-		D_demand   += c.order_quantity;
-		W_max       = std::max(W_max, c.priority_weight);
-		++unassigned;
+		D_demand += c.order_quantity;
 	}
-	if (unassigned == 0) return false;
 
 	double B_supply = 0.0;
 	for (const Bakery& b : bakeries) B_supply += b.current_inventory;
-	if (B_supply <= 0.0) return false;
-
-	if (static_cast<int>(drones.size()) >= unassigned) return false;
 
 	double C_fleet = 0.0;
 	for (const Drone& d : drones) C_fleet += d.max_capacity;
 
-	const bool fleet_overloaded  = D_demand > C_fleet;
-	const bool customer_starving = W_max   >= kPriorityStarvationThreshold;
-	return fleet_overloaded || customer_starving;
+	return (B_supply > 0.0) && (C_fleet < D_demand);
 }
 
 void Simulation::maybe_spawn_drone() {
