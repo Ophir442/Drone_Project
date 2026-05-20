@@ -1,33 +1,62 @@
 #include "simulation.h"
-#include <iostream>
 #include <algorithm>
+#include <iostream>
 #include <limits>
 #include <map>
-
-using namespace std;
+#include <stdexcept>
 
 namespace {
 
-// Per-bakery contention: sort intents by score, give each one what it asked
-// for, truncate or drop later ones if the bakery runs out.
+constexpr double kPriorityStarvationThreshold = 5.0;  ///< W_max trigger for spawning
+constexpr double kRepositionEpsilon           = 0.01; ///< "already there" threshold
+
+/// Expected value of a discrete distribution given as (amount, prob) pairs.
+double expected_value(const std::vector<std::pair<int, double>>& distribution) {
+	double mean = 0.0;
+	for (const auto& [amount, prob] : distribution) mean += amount * prob;
+	return mean;
+}
+
+/// Gravity score = fullness / distance. Higher means more urgent to visit:
+/// a bakery near its ceiling will waste production if no drone arrives, so
+/// closeness * fullness wins over closeness alone.
+double calculate_gravity_score(const Bakery& bakery, double distance) {
+	if (bakery.capacity <= 0) {
+		return -std::numeric_limits<double>::infinity();
+	}
+	const double fullness =
+		(bakery.current_inventory + expected_value(bakery.production_distribution))
+		/ static_cast<double>(bakery.capacity);
+	return fullness / std::max(distance, 1.0);
+}
+
+/// Build a "go to bakery, pick up nothing" RouteNode used for repositioning.
+RouteNode make_repositioning_hop(const Bakery& target) {
+	return {RouteNodeType::BAKERY_PICKUP, target.pos, target.id,
+	        /*customer_id*/ -1, /*bread_amount*/ 0, /*committed*/ false};
+}
+
+/// Bakery-side contention resolution: per bakery, sort intents by score
+/// desc and serve each its full request until the bakery runs out, then
+/// truncate / drop the rest. Mutates `bakeries[].current_inventory`.
 void resolve_bakery_contention(
-	vector<Intent>& intents,
-	vector<Bakery>& bakeries,
-	vector<Intent>& resolved,
-	map<int, int>& allocation)
+	std::vector<Intent>& intents,
+	std::vector<Bakery>& bakeries,
+	std::vector<Intent>& resolved,
+	std::map<int, int>&  allocation)
 {
-	map<int, vector<Intent*>> per_bakery;
+	std::map<int, std::vector<Intent*>> per_bakery;
 	for (auto& it : intents) per_bakery[it.bakery_id].push_back(&it);
 
 	for (auto& [bakery_id, list] : per_bakery) {
-		sort(list.begin(), list.end(),
+		std::sort(list.begin(), list.end(),
 			[](const Intent* a, const Intent* b) {
 				return a->original_score > b->original_score;
 			});
 
 		int available = bakeries[bakery_id].current_inventory;
 		for (Intent* intent : list) {
-			int give = min(intent->requested_bread_amount, available);
+			const int give = std::min(intent->requested_bread_amount, available);
 			allocation[intent->customer_id] = give;
 			if (give > 0) {
 				available -= give;
@@ -40,18 +69,18 @@ void resolve_bakery_contention(
 	}
 }
 
-// Walk the GRASP-optimized route and adjust nodes to match the committed
-// allocations. Truncated intents shrink, dropped intents are removed, and
-// nodes carried over from earlier rounds pass through unchanged.
-vector<RouteNode> apply_allocation_to_route(
-	const vector<RouteNode>& route,
-	const map<int, int>& allocation)
+/// Walk the GRASP-optimized route and adjust node amounts to the resolved
+/// allocations. Truncated intents shrink, dropped intents disappear, and
+/// committed (already-executed) nodes pass through unchanged.
+std::vector<RouteNode> apply_allocation_to_route(
+	const std::vector<RouteNode>& route,
+	const std::map<int, int>& allocation)
 {
-	vector<RouteNode> out;
+	std::vector<RouteNode> out;
 	out.reserve(route.size());
 
 	for (const RouteNode& node : route) {
-		bool is_new_customer_node =
+		const bool is_new_customer_node =
 			!node.committed && node.customer_id >= 0 &&
 			(node.type == RouteNodeType::BAKERY_PICKUP ||
 			 node.type == RouteNodeType::CUSTOMER_DELIVERY);
@@ -61,13 +90,12 @@ vector<RouteNode> apply_allocation_to_route(
 			continue;
 		}
 
-		auto it = allocation.find(node.customer_id);
+		const auto it = allocation.find(node.customer_id);
 		if (it == allocation.end()) {
 			out.push_back(node);
 			continue;
 		}
-
-		if (it->second <= 0) continue; // dropped — skip pickup AND delivery
+		if (it->second <= 0) continue;  // dropped — skip pickup AND delivery
 
 		RouteNode adjusted = node;
 		adjusted.bread_amount = it->second;
@@ -76,16 +104,55 @@ vector<RouteNode> apply_allocation_to_route(
 	return out;
 }
 
-} // namespace
+}  // namespace
 
 
 Simulation::Simulation(const SimConfig& config)
 	: config(config), rng(42), next_customer_id(0), next_drone_id(0),
 	  current_round(0), total_bread_delivered(0), total_customers_served(0) {}
 
+
+/* ---------- validation ---------- */
+
+/// Throw on configurations that can never finish. Subtler shortages (slow
+/// drones, total supply < total demand) still surface only at runtime.
+void Simulation::validate_config() const {
+	if (config.customer_configs.empty()) {
+		throw std::runtime_error(
+			"Invalid config: customer_configs is empty — there is no one to deliver to.");
+	}
+
+	if (config.drone_template.capacity <= 0) {
+		throw std::runtime_error(
+			"Invalid config: drone_template.capacity must be > 0 "
+			"(got " + std::to_string(config.drone_template.capacity) + ").");
+	}
+
+	auto can_supply = [](const BakeryConfig& bc) {
+		if (bc.initial_inventory > 0) return true;
+		for (const auto& [amount, prob] : bc.production_distribution) {
+			if (amount > 0 && prob > 0.0) return true;
+		}
+		return false;
+	};
+
+	const bool any_supply = std::any_of(
+		config.bakery_configs.begin(), config.bakery_configs.end(), can_supply);
+	if (!any_supply) {
+		throw std::runtime_error(
+			"Invalid config: no bakery can supply bread. Every bakery has "
+			"initial_inventory == 0 and a production_distribution with no "
+			"positive-amount outcome at positive probability — the simulation "
+			"would never finish.");
+	}
+}
+
+
+/* ---------- fleet management ---------- */
+
 Drone Simulation::spawn_drone() {
 	const DroneTemplate& t = config.drone_template;
-	uniform_real_distribution<double> velocity_dist(t.velocity_min, t.velocity_max);
+	std::uniform_real_distribution<double> velocity_dist(t.velocity_min, t.velocity_max);
 
 	Drone d;
 	d.id             = next_drone_id++;
@@ -98,22 +165,37 @@ Drone Simulation::spawn_drone() {
 	return d;
 }
 
-// Grow the fleet only when there's unmet demand and every drone is busy.
-// Capped so we never have more drones than customers waiting — that's the
-// "excessive" guard.
-void Simulation::maybe_spawn_drone() {
-	int unassigned = 0;
+/// Supply/demand spawning rule:
+///   B_supply > 0  AND  (D_demand > C_fleet  OR  W_max ≥ threshold)
+/// plus a hard cap `drones.size() < unassigned` so the fleet never outgrows demand.
+bool Simulation::should_spawn_drone() const {
+	double D_demand    = 0.0;
+	double W_max       = 0.0;
+	int    unassigned  = 0;
 	for (const Customer& c : get_all_customers()) {
-		if (!assigned_customer_ids.count(c.id)) ++unassigned;
+		if (assigned_customer_ids.count(c.id)) continue;
+		D_demand   += c.order_quantity;
+		W_max       = std::max(W_max, c.priority_weight);
+		++unassigned;
 	}
-	if (unassigned == 0) return;
+	if (unassigned == 0) return false;
 
-	for (const Drone& d : drones) {
-		if (d.is_idle) return; // existing fleet has spare capacity
-	}
-	if (static_cast<int>(drones.size()) >= unassigned) return;
+	double B_supply = 0.0;
+	for (const Bakery& b : bakeries) B_supply += b.current_inventory;
+	if (B_supply <= 0.0) return false;
 
-	drones.push_back(spawn_drone());
+	if (static_cast<int>(drones.size()) >= unassigned) return false;
+
+	double C_fleet = 0.0;
+	for (const Drone& d : drones) C_fleet += d.max_capacity;
+
+	const bool fleet_overloaded  = D_demand > C_fleet;
+	const bool customer_starving = W_max   >= kPriorityStarvationThreshold;
+	return fleet_overloaded || customer_starving;
+}
+
+void Simulation::maybe_spawn_drone() {
+	if (should_spawn_drone()) drones.push_back(spawn_drone());
 }
 
 Drone* Simulation::find_drone(int id) {
@@ -121,16 +203,15 @@ Drone* Simulation::find_drone(int id) {
 	return nullptr;
 }
 
+
+/* ---------- lifecycle ---------- */
+
 void Simulation::initialize() {
-	for (size_t i = 0; i < config.bakery_configs.size(); ++i) {
+	for (std::size_t i = 0; i < config.bakery_configs.size(); ++i) {
 		const auto& bc = config.bakery_configs[i];
-		Bakery b;
-		b.id = static_cast<int>(i);
-		b.pos = bc.pos;
-		b.capacity = bc.capacity;
-		b.current_inventory = bc.initial_inventory;
-		b.production_distribution = bc.production_distribution;
-		bakeries.push_back(b);
+		bakeries.push_back({static_cast<int>(i), bc.pos,
+		                    bc.initial_inventory, bc.capacity,
+		                    bc.production_distribution});
 	}
 
 	delivery_graph.initialize(bakeries, config.base_pos);
@@ -141,21 +222,21 @@ void Simulation::initialize() {
 
 	for (const auto& cc : config.customer_configs) {
 		Customer c;
-		c.id = next_customer_id++;
-		c.pos = cc.pos;
-		c.order_quantity = cc.order_quantity;
+		c.id              = next_customer_id++;
+		c.pos             = cc.pos;
+		c.order_quantity  = cc.order_quantity;
 		c.priority_weight = 1.0;
 		customer_queue.push(c);
 	}
 
-	thread_pool = make_unique<ThreadPool>(config.thread_count);
+	thread_pool = std::make_unique<ThreadPool>(config.thread_count);
 
-	cout << "Simulation initialized:\n"
-	     << "  Bakeries: "          << bakeries.size() << "\n"
-	     << "  Drones: "            << drones.size() << "\n"
-	     << "  Initial customers: " << customer_queue.size() << "\n"
-	     << "  Grid: "              << config.grid_width << "x" << config.grid_height << "\n"
-	     << "  Threads: "           << config.thread_count << endl;
+	std::cout << "Simulation initialized:\n"
+	          << "  Bakeries: "          << bakeries.size() << "\n"
+	          << "  Drones: "            << drones.size() << "\n"
+	          << "  Initial customers: " << customer_queue.size() << "\n"
+	          << "  Grid: "              << config.grid_width << "x" << config.grid_height << "\n"
+	          << "  Threads: "           << config.thread_count << "\n";
 }
 
 void Simulation::reset() {
@@ -165,26 +246,27 @@ void Simulation::reset() {
 	last_resolved_intents.clear();
 	assigned_customer_ids.clear();
 	served_this_round.clear();
-	current_round = 0;
-	next_customer_id = 0;
-	next_drone_id = 0;
-	total_bread_delivered = 0;
+	current_round          = 0;
+	next_customer_id       = 0;
+	next_drone_id          = 0;
+	total_bread_delivered  = 0;
 	total_customers_served = 0;
 	rng.seed(42);
 	initialize();
 }
 
-void Simulation::add_customer(double x, double y, int order_quantity, const string&) {
+void Simulation::add_customer(double x, double y, int order_quantity,
+                              const std::string& /*name*/) {
 	Customer c;
-	c.id = next_customer_id++;
-	c.pos = {x, y};
-	c.order_quantity = order_quantity;
+	c.id              = next_customer_id++;
+	c.pos             = {x, y};
+	c.order_quantity  = order_quantity;
 	c.priority_weight = 1.0;
 	customer_queue.push(c);
 }
 
 void Simulation::remove_customer(int customer_id) {
-	vector<Customer> kept;
+	std::vector<Customer> kept;
 	while (!customer_queue.empty()) {
 		Customer c = customer_queue.top();
 		customer_queue.pop();
@@ -193,8 +275,8 @@ void Simulation::remove_customer(int customer_id) {
 	for (const Customer& c : kept) customer_queue.push(c);
 }
 
-vector<Customer> Simulation::get_all_customers() const {
-	vector<Customer> out;
+std::vector<Customer> Simulation::get_all_customers() const {
+	std::vector<Customer> out;
 	auto copy = customer_queue;
 	while (!copy.empty()) {
 		out.push_back(copy.top());
@@ -203,24 +285,27 @@ vector<Customer> Simulation::get_all_customers() const {
 	return out;
 }
 
-// One velocity step toward the next route node. On arrival, mark a pickup
-// committed (cargo loaded) or queue a delivery event. Deliveries are queued
-// here and applied later in apply_delivery_events to keep this thread-safe.
+
+/* ---------- per-drone motion ---------- */
+
+/// One velocity step toward the next route node. Pickups commit cargo
+/// immediately; deliveries queue an event so the priority_queue mutation
+/// stays on the main thread.
 void Simulation::advance_drone(Drone& drone) {
 	if (drone.planned_route.empty() ||
 	    drone.route_progress >= static_cast<int>(drone.planned_route.size())) {
 		drone.planned_route.clear();
 		drone.route_progress = 0;
-		drone.is_idle = true;
+		drone.is_idle        = true;
 		return;
 	}
 
 	drone.is_idle = false;
 	RouteNode& target = drone.planned_route[drone.route_progress];
-	double dist = DeliveryGraph::compute_distance(drone.current_pos, target.pos);
+	const double dist = DeliveryGraph::compute_distance(drone.current_pos, target.pos);
 
 	if (dist > drone.velocity) {
-		double ratio = drone.velocity / dist;
+		const double ratio = drone.velocity / dist;
 		drone.current_pos.x += (target.pos.x - drone.current_pos.x) * ratio;
 		drone.current_pos.y += (target.pos.y - drone.current_pos.y) * ratio;
 		return;
@@ -228,7 +313,7 @@ void Simulation::advance_drone(Drone& drone) {
 
 	drone.current_pos = target.pos;
 	if (target.type == RouteNodeType::BAKERY_PICKUP) {
-		target.committed = true;
+		target.committed   = true;
 		drone.current_load += target.bread_amount;
 	} else if (target.type == RouteNodeType::CUSTOMER_DELIVERY) {
 		drone.current_load -= target.bread_amount;
@@ -237,11 +322,12 @@ void Simulation::advance_drone(Drone& drone) {
 	drone.route_progress++;
 }
 
-// Sequential — the priority queue isn't thread-safe.
+/// Drain queued delivery events into the customer queue. Single-threaded:
+/// std::priority_queue is not thread-safe.
 void Simulation::apply_delivery_events() {
 	served_this_round.clear();
 
-	map<int, int> delivered;
+	std::map<int, int> delivered;
 	for (Drone& d : drones) {
 		for (const DeliveryEvent& ev : d.pending_deliveries) {
 			delivered[ev.customer_id] += ev.bread_delivered;
@@ -253,11 +339,11 @@ void Simulation::apply_delivery_events() {
 	}
 	if (delivered.empty()) return;
 
-	vector<Customer> kept;
+	std::vector<Customer> kept;
 	while (!customer_queue.empty()) {
 		Customer c = customer_queue.top();
 		customer_queue.pop();
-		auto it = delivered.find(c.id);
+		const auto it = delivered.find(c.id);
 		if (it != delivered.end()) {
 			c.order_quantity -= it->second;
 			if (c.order_quantity <= 0) {
@@ -270,41 +356,44 @@ void Simulation::apply_delivery_events() {
 	for (const Customer& c : kept) customer_queue.push(c);
 }
 
-// Stage 1: bakery production and drone movement run in parallel; bookkeeping
-// (delivery events, priority increments) is applied sequentially after.
+
+/* ---------- pipeline ---------- */
+
+/// Stage 1: bakery production + drone motion in parallel; post-step
+/// bookkeeping (delivery events, priority increments) on the main thread.
 void Simulation::stage1_state_update() {
-	vector<future<void>> futures;
+	std::vector<std::future<void>> futures;
 
-	// One RNG per bakery so worker threads don't share the master rng.
-	vector<mt19937> bakery_rngs;
+	// One RNG per bakery — workers must not share the master rng.
+	std::vector<std::mt19937> bakery_rngs;
 	bakery_rngs.reserve(bakeries.size());
-	for (size_t i = 0; i < bakeries.size(); ++i) bakery_rngs.emplace_back(rng());
+	for (std::size_t i = 0; i < bakeries.size(); ++i) bakery_rngs.emplace_back(rng());
 
-	for (size_t i = 0; i < bakeries.size(); ++i) {
+	for (std::size_t i = 0; i < bakeries.size(); ++i) {
 		futures.push_back(thread_pool->submit([this, i, &bakery_rngs] {
-			uniform_real_distribution<double> p(0.0, 1.0);
-			double roll = p(bakery_rngs[i]);
+			std::uniform_real_distribution<double> p(0.0, 1.0);
+			const double roll = p(bakery_rngs[i]);
 			double cum = 0.0;
 			for (const auto& [amount, prob] : bakeries[i].production_distribution) {
 				cum += prob;
 				if (roll <= cum) {
-					bakeries[i].current_inventory =
-						min(bakeries[i].current_inventory + amount, bakeries[i].capacity);
+					bakeries[i].current_inventory = std::min(
+						bakeries[i].current_inventory + amount, bakeries[i].capacity);
 					break;
 				}
 			}
 		}));
 	}
 
-	for (size_t i = 0; i < drones.size(); ++i) {
+	for (std::size_t i = 0; i < drones.size(); ++i) {
 		futures.push_back(thread_pool->submit([this, i] { advance_drone(drones[i]); }));
 	}
 	for (auto& f : futures) f.get();
 
 	apply_delivery_events();
 
-	// Spec: customers not served this round get +priority_increment.
-	vector<Customer> customers = get_all_customers();
+	// Customers not served this round get +priority_increment.
+	std::vector<Customer> customers = get_all_customers();
 	while (!customer_queue.empty()) customer_queue.pop();
 	for (Customer c : customers) {
 		if (!served_this_round.count(c.id)) c.priority_weight += config.priority_increment;
@@ -312,22 +401,26 @@ void Simulation::stage1_state_update() {
 	}
 }
 
-// Stages 2-3: parallel GRASP. Each thread runs its share of iterations on a
-// private snapshot and returns its best solution; we pick the best overall.
+/// Stages 2-3: parallel GRASP. The distance matrix is built once on the
+/// main thread (no OMP, so the custom ThreadPool isn't oversubscribed);
+/// each worker runs its share of iterations on private snapshots.
 GraspSolution Simulation::stage2_3_assignment() {
-	vector<Customer> customers;
+	std::vector<Customer> customers;
 	for (const Customer& c : get_all_customers()) {
 		if (!assigned_customer_ids.count(c.id)) customers.push_back(c);
 	}
 	if (customers.empty()) return {};
 
-	vector<Bakery> bakeries_snap = bakeries;
-	vector<Drone>  drones_snap   = drones;
+	std::vector<Bakery> bakeries_snap = bakeries;
+	std::vector<Drone>  drones_snap   = drones;
 
-	int total_iters = config.grasp_iterations;
-	int num_threads = min(config.thread_count, total_iters);
+	DistanceCache dist_cache;
+	dist_cache.build(bakeries_snap, customers, drones_snap, config.base_pos);
 
-	vector<mt19937> thread_rngs;
+	const int total_iters = config.grasp_iterations;
+	const int num_threads = std::min(config.thread_count, total_iters);
+
+	std::vector<std::mt19937> thread_rngs;
 	thread_rngs.reserve(num_threads);
 	for (int i = 0; i < num_threads; ++i) thread_rngs.emplace_back(rng());
 
@@ -336,23 +429,25 @@ GraspSolution Simulation::stage2_3_assignment() {
 		double score = -1.0;
 	};
 
-	vector<future<ThreadResult>> futures;
-	int per_thread = total_iters / num_threads;
-	int extras     = total_iters % num_threads;
+	std::vector<std::future<ThreadResult>> futures;
+	const int per_thread = total_iters / num_threads;
+	const int extras     = total_iters % num_threads;
 
 	for (int t = 0; t < num_threads; ++t) {
-		int my_iters = per_thread + (t < extras ? 1 : 0);
+		const int my_iters = per_thread + (t < extras ? 1 : 0);
 		futures.push_back(thread_pool->submit(
-			[this, &customers, &bakeries_snap, &drones_snap, &thread_rngs, t, my_iters] {
+			[this, &customers, &bakeries_snap, &drones_snap,
+			 &dist_cache, &thread_rngs, t, my_iters] {
 				GraspSolver solver(delivery_graph, config.rcl_size, config.grasp_iterations);
 				ThreadResult best;
 				for (int i = 0; i < my_iters; ++i) {
 					GraspSolution sol = solver.run_single_iteration(
-						customers, drones_snap, bakeries_snap, config.base_pos, thread_rngs[t]);
-					double s = GraspSolver::evaluate_solution(sol.intents);
+						customers, drones_snap, bakeries_snap,
+						config.base_pos, dist_cache, thread_rngs[t]);
+					const double s = GraspSolver::evaluate_solution(sol.intents);
 					if (s > best.score) {
-						best.score = s;
-						best.solution = move(sol);
+						best.score    = s;
+						best.solution = std::move(sol);
 					}
 				}
 				return best;
@@ -365,18 +460,17 @@ GraspSolution Simulation::stage2_3_assignment() {
 		ThreadResult r = f.get();
 		if (r.score > best_score) {
 			best_score = r.score;
-			best = move(r.solution);
+			best       = std::move(r.solution);
 		}
 	}
 	return best;
 }
 
-// Stage 4: synchronized commit. Resolve bakery contention by score, then
-// write the optimized routes back to the real drones with bread_amounts
-// adjusted to the resolved allocations.
+/// Stage 4: resolve contention, stamp final amounts onto each drone's
+/// route, then send any remaining idle drone toward a high-gravity bakery.
 void Simulation::stage4_commit(GraspSolution& solution) {
-	vector<Intent> resolved;
-	map<int, int>  allocation;
+	std::vector<Intent> resolved;
+	std::map<int, int>  allocation;
 	resolve_bakery_contention(solution.intents, bakeries, resolved, allocation);
 
 	for (auto& [drone_id, route] : solution.drone_routes) {
@@ -387,7 +481,7 @@ void Simulation::stage4_commit(GraspSolution& solution) {
 		             d->route_progress >= static_cast<int>(d->planned_route.size());
 	}
 
-	set<int> assigned_drone_ids;
+	std::set<int> assigned_drone_ids;
 	for (const Intent& it : resolved) {
 		assigned_customer_ids.insert(it.customer_id);
 		assigned_drone_ids.insert(it.drone_id);
@@ -398,41 +492,48 @@ void Simulation::stage4_commit(GraspSolution& solution) {
 	last_resolved_intents = resolved;
 }
 
-// Each idle drone repositions to its own nearest bakery. Picking the
-// globally best-stocked bakery for everyone caused all idle drones to swarm
-// the same spot; nearest-neighbour spreads the fleet across the map.
-void Simulation::reposition_idle_drones(const set<int>& assigned_drone_ids) {
+
+/* ---------- idle repositioning ---------- */
+
+/// Pick the bakery with the highest Gravity Score from this drone's
+/// current position. Returns nullptr if there are no bakeries.
+const Bakery* Simulation::choose_repositioning_target(const Drone& drone) const {
+	const Bakery* best = nullptr;
+	double best_score  = -std::numeric_limits<double>::infinity();
+	for (const Bakery& b : bakeries) {
+		const double dist  = DeliveryGraph::compute_distance(drone.current_pos, b.pos);
+		const double score = calculate_gravity_score(b, dist);
+		if (score > best_score) {
+			best_score = score;
+			best       = &b;
+		}
+	}
+	return best;
+}
+
+/// Send each truly-idle drone to its highest-gravity bakery so that
+/// stochastic production isn't wasted on a full silo.
+void Simulation::reposition_idle_drones(const std::set<int>& assigned_drone_ids) {
 	if (bakeries.empty()) return;
 
 	for (Drone& d : drones) {
 		if (!d.is_idle || assigned_drone_ids.count(d.id)) continue;
 		if (!d.planned_route.empty()) continue;
 
-		int closest_id = -1;
-		double closest_dist = numeric_limits<double>::max();
-		for (const Bakery& b : bakeries) {
-			double dist = DeliveryGraph::compute_distance(d.current_pos, b.pos);
-			if (dist < closest_dist) {
-				closest_dist = dist;
-				closest_id   = b.id;
-			}
-		}
-		if (closest_id < 0 || closest_dist < 0.01) continue; // already there
+		const Bakery* target = choose_repositioning_target(d);
+		if (!target) continue;
 
-		const Bakery& target = bakeries[closest_id];
-		RouteNode hop;
-		hop.type         = RouteNodeType::BAKERY_PICKUP;
-		hop.pos          = target.pos;
-		hop.entity_id    = target.id;
-		hop.customer_id  = -1; // not tied to any customer
-		hop.bread_amount = 0;  // repositioning only
-		hop.committed    = false;
+		const double dist = DeliveryGraph::compute_distance(d.current_pos, target->pos);
+		if (dist < kRepositionEpsilon) continue;  // already at the target
 
-		d.planned_route.push_back(hop);
+		d.planned_route.push_back(make_repositioning_hop(*target));
 		d.route_progress = 0;
-		d.is_idle = false;
+		d.is_idle        = false;
 	}
 }
+
+
+/* ---------- top level ---------- */
 
 bool Simulation::step_round() {
 	if (current_round >= config.max_rounds) return false;
@@ -444,7 +545,7 @@ bool Simulation::step_round() {
 	current_round++;
 
 	if (customer_queue.empty()) {
-		bool all_idle = all_of(drones.begin(), drones.end(),
+		const bool all_idle = std::all_of(drones.begin(), drones.end(),
 			[](const Drone& d) { return d.is_idle; });
 		if (all_idle) return false;
 	}
@@ -452,21 +553,23 @@ bool Simulation::step_round() {
 }
 
 void Simulation::run() {
+	validate_config();
 	initialize();
 
-	cout << "\nStarting simulation\n";
+	std::cout << "\nStarting simulation\n";
 	for (int round = 0; round < config.max_rounds; ++round) {
-		cout << "\r  Round " << (round + 1) << "/" << config.max_rounds
-		     << " | Customers: " << customer_queue.size()
-		     << " | Drones: "    << drones.size()
-		     << flush;
+		std::cout << "\r  Round " << (round + 1) << "/" << config.max_rounds
+		          << " | Customers: " << customer_queue.size()
+		          << " | Drones: "    << drones.size()
+		          << std::flush;
 		if (!step_round()) {
-			cout << "\nAll customers served. Stopping at round " << (round + 1) << "\n";
+			std::cout << "\nAll customers served. Stopping at round "
+			          << (round + 1) << "\n";
 			break;
 		}
 	}
 
-	cout << "\nDone."
-	     << " Bread delivered: "  << total_bread_delivered
-	     << ", Customers served: " << total_customers_served << "\n";
+	std::cout << "\nDone."
+	          << " Bread delivered: "  << total_bread_delivered
+	          << ", Customers served: " << total_customers_served << "\n";
 }
