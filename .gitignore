@@ -3,11 +3,6 @@ node_modules/
 
 # Build artifacts
 frontend/build/
-backend/build/
-
-# Simulation output (generated at runtime)
-output/
-frontend/public/state_log.json
 
 # IDE / editor
 .vscode/
@@ -19,12 +14,6 @@ frontend/public/state_log.json
 # OS files
 .DS_Store
 Thumbs.db
-
-# CMake
-CMakeCache.txt
-CMakeFiles/
-cmake_install.cmake
-Makefile
 
 # Compiled binaries
 *.o

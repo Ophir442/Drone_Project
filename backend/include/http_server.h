@@ -1,8 +1,7 @@
 #pragma once
 
-#include "simulation.hpp"
+#include "simulation.h"
 #include <string>
-#include <functional>
 #include <thread>
 #include <atomic>
 
@@ -24,7 +23,6 @@ private:
 	void run_server();
 	void handle_client(int client_fd);
 
-	// Route handlers
 	std::string handle_get_state();
 	std::string handle_step();
 	std::string handle_add_customer(const std::string& body);
@@ -33,7 +31,6 @@ private:
 	std::string handle_reset();
 	std::string handle_config();
 
-	// HTTP helpers
 	std::string make_response(int status, const std::string& body);
 	std::string make_cors_headers();
 	std::string parse_body(const std::string& request);

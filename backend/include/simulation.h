@@ -1,14 +1,14 @@
 #pragma once
 
-#include "types.hpp"
-#include "distance.hpp"
-#include "grasp.hpp"
-#include "thread_pool.hpp"
-#include "state_logger.hpp"
+#include "types.h"
+#include "distance.h"
+#include "grasp.h"
+#include "thread_pool.h"
 #include <vector>
 #include <queue>
 #include <random>
 #include <set>
+#include <memory>
 
 class Simulation {
 public:
@@ -41,9 +41,8 @@ private:
 	std::vector<Drone>             drones;
 	DeliveryGraph                  delivery_graph;
 
-	std::unique_ptr<ThreadPool>  thread_pool;
-	std::unique_ptr<StateLogger> logger;
-	std::mt19937                 rng;
+	std::unique_ptr<ThreadPool> thread_pool;
+	std::mt19937                rng;
 
 	int next_customer_id;
 	int next_drone_id;
@@ -52,18 +51,17 @@ private:
 	int total_customers_served;
 
 	std::vector<Intent> last_resolved_intents;
-	std::set<int>       assigned_customer_ids; // customers with a drone already en route
-	std::set<int>       served_this_round;     // customers who got bread this round
+	std::set<int>       assigned_customer_ids;
+	std::set<int>       served_this_round;
 
-	// The four pipeline stages.
 	void stage1_state_update();
 	GraspSolution stage2_3_assignment();
 	void stage4_commit(GraspSolution& solution);
 
-	// Helpers used by the stages.
 	void  advance_drone(Drone& drone);
 	void  apply_delivery_events();
 	void  reposition_idle_drones(const std::set<int>& assigned_drone_ids);
-	Drone spawn_drone(const DroneConfig& dc);
+	void  maybe_spawn_drone();
+	Drone spawn_drone();
 	Drone* find_drone(int id);
 };

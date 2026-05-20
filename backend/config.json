@@ -16,13 +16,12 @@
 		"thread_count": 4
 	},
 
-	"drones": [
-		{ "velocity": 5.0, "capacity": 15 },
-		{ "velocity": 7.0, "capacity": 10 },
-		{ "velocity": 5.0, "capacity": 15 },
-		{ "velocity": 6.0, "capacity": 12 },
-		{ "velocity": 5.0, "capacity": 15 }
-	],
+	"drone_template": {
+		"capacity": 15,
+		"velocity_min": 3.0,
+		"velocity_max": 8.0,
+		"initial_count": 1
+	},
 
 	"bakeries": [
 		{

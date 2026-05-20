@@ -10,14 +10,12 @@
 
 class ThreadPool {
 public:
-	explicit ThreadPool(size_t num_threads);
+	explicit ThreadPool(std::size_t num_threads);
 	~ThreadPool();
 
-	// Submit a task and get a future for the result
 	template<typename F, typename... Args>
 	auto submit(F&& f, Args&&... args) -> std::future<decltype(f(args...))>;
 
-	// Wait for all submitted tasks to complete
 	void wait_all();
 
 private:
@@ -30,7 +28,6 @@ private:
 	int active_tasks;
 };
 
-// Template implementation must be in header
 template<typename F, typename... Args>
 auto ThreadPool::submit(F&& f, Args&&... args) -> std::future<decltype(f(args...))> {
 	using return_type = decltype(f(args...));
