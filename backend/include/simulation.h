@@ -25,7 +25,7 @@ public:
 	explicit Simulation(const SimConfig& config);
 
 	/// Validate the config, initialize state, and loop step_round() until
-	/// max_rounds or until every customer is served and every drone idle.
+	/// every customer is served and every drone is idle.
 	void run();
 
 	void initialize();

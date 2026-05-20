@@ -241,12 +241,12 @@ string HttpServer::handle_config() {
 	j["grid_width"]         = cfg.grid_width;
 	j["grid_height"]        = cfg.grid_height;
 	j["num_active_drones"]  = static_cast<int>(sim.get_drones().size());
-	j["drone_capacity"]     = cfg.drone_template.capacity;
+	j["drone_capacity_min"] = cfg.drone_template.capacity_min;
+	j["drone_capacity_max"] = cfg.drone_template.capacity_max;
 	j["drone_velocity_min"] = cfg.drone_template.velocity_min;
 	j["drone_velocity_max"] = cfg.drone_template.velocity_max;
 	j["num_bakeries"]       = static_cast<int>(cfg.bakery_configs.size());
 	j["num_customers"]      = static_cast<int>(cfg.customer_configs.size());
-	j["max_rounds"]         = cfg.max_rounds;
 	j["grasp_iterations"]   = cfg.grasp_iterations;
 	j["rcl_size"]           = cfg.rcl_size;
 	j["thread_count"]       = cfg.thread_count;

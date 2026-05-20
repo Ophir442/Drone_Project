@@ -37,7 +37,6 @@ SimConfig load_config(const string& path) {
 	config.base_pos.y  = world.at("base_pos").value("y", 50.0);
 
 	const auto& sim = j.at("simulation");
-	config.max_rounds         = sim.value("max_rounds", 50);
 	config.priority_increment = sim.value("priority_increment", 1.0);
 
 	const auto& algo = j.at("algorithm");
@@ -47,7 +46,8 @@ SimConfig load_config(const string& path) {
 	config.thread_count     = algo.value("thread_count", hw > 0 ? hw : 4);
 
 	const auto& dt = j.at("drone_template");
-	config.drone_template.capacity      = dt.value("capacity", 15);
+	config.drone_template.capacity_min  = dt.value("capacity_min", 10);
+	config.drone_template.capacity_max  = dt.value("capacity_max", 20);
 	config.drone_template.velocity_min  = dt.value("velocity_min", 3.0);
 	config.drone_template.velocity_max  = dt.value("velocity_max", 8.0);
 	config.drone_template.initial_count = dt.value("initial_count", 1);

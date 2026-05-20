@@ -6,20 +6,20 @@
 	},
 
 	"simulation": {
-		"max_rounds": 100,
 		"priority_increment": 1.0
 	},
 
 	"algorithm": {
-		"grasp_iterations": 5,
+		"grasp_iterations": 50,
 		"rcl_size": 3,
-		"thread_count": 4
+		"thread_count": 8
 	},
 
 	"drone_template": {
-		"capacity": 15,
+		"capacity_min": 10,
+		"capacity_max": 20,
 		"velocity_min": 3.0,
-		"velocity_max": 8.0,
+		"velocity_max": 15.0,
 		"initial_count": 1
 	},
 

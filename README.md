@@ -69,7 +69,6 @@ Edit `backend/config.json`:
 |---|---|
 | `world.grid_width` / `grid_height` | Grid bounds |
 | `world.base_pos` | Drone base coordinates |
-| `simulation.max_rounds` | Round cap |
 | `simulation.priority_increment` | Bump applied each round to unserved customers (spec rule `w_c + 1`) |
 | `algorithm.grasp_iterations` | Total GRASP iterations per round (split across workers) |
 | `algorithm.rcl_size` | Restricted Candidate List size for the GRASP random pick |

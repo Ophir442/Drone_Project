@@ -91,7 +91,8 @@ struct Intent {
 };
 
 struct DroneTemplate {
-	int capacity;
+	int capacity_min;
+	int capacity_max;
 	double velocity_min;
 	double velocity_max;
 	int initial_count;
@@ -113,7 +114,6 @@ struct CustomerConfig {
 struct SimConfig {
 	int grid_width;
 	int grid_height;
-	int max_rounds;
 	double priority_increment;
 	int grasp_iterations;
 	int rcl_size;

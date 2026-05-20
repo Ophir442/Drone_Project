@@ -9,6 +9,17 @@ namespace {
 
 constexpr double kRepositionEpsilon = 0.01;  ///< "already there" threshold
 
+/// Build a fully-seeded Mersenne Twister. `std::random_device` provides
+/// non-deterministic entropy (on Linux: /dev/urandom); feeding it through
+/// `std::seed_seq` with eight draws fills mt19937's 19937-bit state
+/// properly instead of relying on the warm-up pattern that a single
+/// 32-bit seed produces. Called only from the main thread.
+std::mt19937 make_random_engine() {
+	std::random_device rd;
+	std::seed_seq seq{rd(), rd(), rd(), rd(), rd(), rd(), rd(), rd()};
+	return std::mt19937(seq);
+}
+
 /// Expected value of a discrete distribution given as (amount, prob) pairs.
 double expected_value(const std::vector<std::pair<int, double>>& distribution) {
 	double mean = 0.0;
@@ -107,7 +118,8 @@ std::vector<RouteNode> apply_allocation_to_route(
 
 
 Simulation::Simulation(const SimConfig& config)
-	: config(config), rng(42), next_customer_id(0), next_drone_id(0),
+	: config(config), rng(make_random_engine()),
+	  next_customer_id(0), next_drone_id(0),
 	  current_round(0), total_bread_delivered(0), total_customers_served(0) {}
 
 
@@ -121,10 +133,17 @@ void Simulation::validate_config() const {
 			"Invalid config: customer_configs is empty — there is no one to deliver to.");
 	}
 
-	if (config.drone_template.capacity <= 0) {
+	if (config.drone_template.capacity_min <= 0) {
 		throw std::runtime_error(
-			"Invalid config: drone_template.capacity must be > 0 "
-			"(got " + std::to_string(config.drone_template.capacity) + ").");
+			"Invalid config: drone_template.capacity_min must be > 0 "
+			"(got " + std::to_string(config.drone_template.capacity_min) + ").");
+	}
+	if (config.drone_template.capacity_max < config.drone_template.capacity_min) {
+		throw std::runtime_error(
+			"Invalid config: drone_template.capacity_max ("
+			+ std::to_string(config.drone_template.capacity_max)
+			+ ") must be >= capacity_min ("
+			+ std::to_string(config.drone_template.capacity_min) + ").");
 	}
 
 	auto can_supply = [](const BakeryConfig& bc) {
@@ -152,13 +171,14 @@ void Simulation::validate_config() const {
 Drone Simulation::spawn_drone() {
 	const DroneTemplate& t = config.drone_template;
 	std::uniform_real_distribution<double> velocity_dist(t.velocity_min, t.velocity_max);
+	std::uniform_int_distribution<int>     capacity_dist(t.capacity_min, t.capacity_max);
 
 	Drone d;
 	d.id             = next_drone_id++;
 	d.current_pos    = config.base_pos;
 	d.velocity       = velocity_dist(rng);
 	d.current_load   = 0;
-	d.max_capacity   = t.capacity;
+	d.max_capacity   = capacity_dist(rng);
 	d.route_progress = 0;
 	d.is_idle        = true;
 	return d;
@@ -243,7 +263,7 @@ void Simulation::reset() {
 	next_drone_id          = 0;
 	total_bread_delivered  = 0;
 	total_customers_served = 0;
-	rng.seed(42);
+	rng = make_random_engine();
 	initialize();
 }
 
@@ -528,8 +548,6 @@ void Simulation::reposition_idle_drones(const std::set<int>& assigned_drone_ids)
 /* ---------- top level ---------- */
 
 bool Simulation::step_round() {
-	if (current_round >= config.max_rounds) return false;
-
 	maybe_spawn_drone();
 	stage1_state_update();
 	GraspSolution solution = stage2_3_assignment();
@@ -549,17 +567,16 @@ void Simulation::run() {
 	initialize();
 
 	std::cout << "\nStarting simulation\n";
-	for (int round = 0; round < config.max_rounds; ++round) {
-		std::cout << "\r  Round " << (round + 1) << "/" << config.max_rounds
+	while (true) {
+		const bool more = step_round();
+		std::cout << "\r  Round " << current_round
 		          << " | Customers: " << customer_queue.size()
 		          << " | Drones: "    << drones.size()
 		          << std::flush;
-		if (!step_round()) {
-			std::cout << "\nAll customers served. Stopping at round "
-			          << (round + 1) << "\n";
-			break;
-		}
+		if (!more) break;
 	}
+	std::cout << "\nAll customers served. Stopping at round "
+	          << current_round << "\n";
 
 	std::cout << "\nDone."
 	          << " Bread delivered: "  << total_bread_delivered

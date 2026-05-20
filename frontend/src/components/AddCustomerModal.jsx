@@ -57,7 +57,6 @@ export default function AddCustomerModal({ initialPos, gridWidth, gridHeight, on
               style={styles.input}
               type="number"
               min="1"
-              max="20"
               value={qty}
               onChange={e => setQty(e.target.value)}
               required
