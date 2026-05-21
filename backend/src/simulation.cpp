@@ -427,13 +427,6 @@ void Simulation::initialize() {
 	}
 
 	thread_pool = std::make_unique<ThreadPool>(config.thread_count);
-
-	std::cout << "Simulation initialized:\n"
-	          << "  Bakeries: "          << bakeries.size() << "\n"
-	          << "  Drones: "            << drones.size() << "\n"
-	          << "  Initial customers: " << customer_queue.size() << "\n"
-	          << "  Grid: "              << config.grid_width << "x" << config.grid_height << "\n"
-	          << "  Threads: "           << config.thread_count << "\n";
 }
 
 void Simulation::reset() {
@@ -849,19 +842,5 @@ void Simulation::run() {
 	validate_config();
 	initialize();
 
-	std::cout << "\nStarting simulation\n";
-	while (true) {
-		const bool more = step_round();
-		std::cout << "\r  Round " << current_round
-		          << " | Customers: " << customer_queue.size()
-		          << " | Drones: "    << drones.size()
-		          << std::flush;
-		if (!more) break;
-	}
-	std::cout << "\nAll customers served. Stopping at round "
-	          << current_round << "\n";
-
-	std::cout << "\nDone."
-	          << " Bread delivered: "  << total_bread_delivered
-	          << ", Customers served: " << total_customers_served << "\n";
+	while (step_round()) {}
 }

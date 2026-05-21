@@ -131,15 +131,12 @@ int main(int argc, char* argv[]) {
 		std::signal(SIGINT,  signal_handler);
 		std::signal(SIGTERM, signal_handler);
 
-		std::cout << "Starting in server mode on port " << args.port << "\n";
-		std::cout << "Press Ctrl+C to stop.\n";
 		server.start();
 
 		while (!g_shutdown_requested.load(std::memory_order_relaxed)) {
 			std::this_thread::sleep_for(std::chrono::milliseconds(200));
 		}
 
-		std::cout << "\nShutting down…" << std::endl;
 		server.stop();
 		return 0;
 	}

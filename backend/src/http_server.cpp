@@ -72,8 +72,6 @@ void HttpServer::run_server() {
 		return;
 	}
 
-	std::cout << "HTTP server listening on port " << port << std::endl;
-
 	// INVARIANT: handle_client must be called synchronously here.
 	// Spawning a per-client worker would race Simulation's internal state.
 	while (running.load()) {
