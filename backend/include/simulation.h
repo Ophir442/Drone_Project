@@ -1,35 +1,55 @@
 #pragma once
 
-#include "types.h"
 #include "distance.h"
 #include "grasp.h"
 #include "thread_pool.h"
-#include <vector>
+#include "types.h"
+#include <memory>
 #include <queue>
 #include <random>
 #include <set>
-#include <memory>
+#include <vector>
 
-/// Orchestrates one parallel bread-delivery run.
-///
-/// Each round follows a 4-stage pipeline:
-///   1. state update    — bakery production + drone motion (parallel)
-///   2. GRASP planning  — N iterations across the thread pool (parallel)
-///   3. contention      — bakery-side resolution by score (serial)
-///   4. commit          — write routes, reposition idle drones (serial)
-///
-/// All mutation of the customer priority_queue and assigned-id sets happens
-/// on the main thread so the priority_queue stays single-writer.
+/**
+ * @brief Orchestrates one parallel bread-delivery simulation.
+ *
+ * Per-round pipeline:
+ *   1. STATE UPDATE  — bakery production + drone motion (parallel)
+ *   2. GRASP PLAN    — N iterations across the thread pool (parallel)
+ *   3. CONTENTION    — bakery-side resolution by score (serial)
+ *   4. COMMIT        — stamp routes, reposition idle drones (serial)
+ *
+ * Stages 3+4 together form a two-phase commit:
+ *   - Phase 1 (planning): GRASP workers run on snapshots and produce
+ *     non-binding @c Intent records. Because every worker operates on a
+ *     private copy of the bakery inventory, multiple workers may "promise"
+ *     the same bread to different customers.
+ *   - Phase 2 (commit): @c resolve_bakery_contention reconciles those
+ *     promises against the real, shared inventory — by score, highest first
+ *     — and emits the actual allocation. Only allocations that survive
+ *     contention are written to drone routes.
+ *
+ * All mutation of the customer priority_queue and the assigned-id sets
+ * happens on the main thread so the priority_queue stays single-writer.
+ */
 class Simulation {
 public:
 	explicit Simulation(const SimConfig& config);
 
-	/// Validate the config, initialize state, and loop step_round() until
-	/// every customer is served and every drone is idle.
+	/// Validate the config, initialize state, then loop step_round() until
+	/// every customer is served and every drone is idle (or until the
+	/// no-progress halt clause fires).
 	void run();
 
+	/// Build initial bakeries, drones, and customer queue. Idempotent if
+	/// reset() is called first.
 	void initialize();
+
+	/// Tear down all per-run state and re-initialize from the original config.
 	void reset();
+
+	/// Advance the simulation by exactly one round. Returns false when the
+	/// simulation can terminate (all served, or no progress possible).
 	bool step_round();
 
 	// ---- customer mutation (server / live-edit) ----
@@ -37,7 +57,7 @@ public:
 	                  const std::string& name = "");
 	void remove_customer(int customer_id);
 
-	// ---- snapshots ----
+	// ---- snapshots (read-only views for the HTTP layer) ----
 	const std::vector<Bakery>& get_bakeries() const { return bakeries; }
 	const std::vector<Drone>&  get_drones()   const { return drones; }
 	std::vector<Customer>      get_all_customers() const;
@@ -81,7 +101,7 @@ private:
 	void advance_drone(Drone& drone);
 	void apply_delivery_events();
 
-	// ---- fleet management ----
+	// ---- fleet management (auto-scaling) ----
 	void  maybe_spawn_drone();
 	bool  should_spawn_drone() const;
 	Drone spawn_drone();

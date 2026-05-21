@@ -1,20 +1,26 @@
 #pragma once
 
 #include "types.h"
-#include <vector>
 #include <unordered_map>
+#include <vector>
 
-/// Static distance graph: pre-computed bakery↔bakery and bakery↔base matrix.
-/// Built once during simulation initialization and never mutated afterwards.
+/**
+ * @brief Static distance graph over bakeries + base.
+ *
+ * Built once during Simulation::initialize and never mutated afterwards.
+ * The base is always the last node so its index is @c node_count - 1.
+ * Callers without a precomputed node id may use @c hybrid_distance or
+ * @c compute_distance for an on-the-fly Euclidean fallback.
+ */
 class DeliveryGraph {
 public:
-	/// Populate the symmetric adjacency matrix. Base is the last node.
+	/// Populate the symmetric adjacency matrix. Base is appended last.
 	void initialize(const std::vector<Bakery>& bakeries, const Position& base_pos);
 
-	/// O(1) lookup; both endpoints must be valid node ids.
+	/// O(1) lookup; both endpoints must be valid node ids in [0, node_count).
 	double get_static_distance(int from_node, int to_node) const;
 
-	/// Plain Euclidean — exposed for callers that don't have node ids.
+	/// Plain Euclidean — exposed for callers without node ids.
 	static double compute_distance(const Position& a, const Position& b);
 
 	/// Matrix lookup when both nodes are in range; Euclidean fallback otherwise.
@@ -29,19 +35,23 @@ private:
 	int node_count = 0;
 };
 
-/// Per-round distance cache: every entity GRASP touches (bakeries, the active
-/// customer set, drone start positions, base). Built once on the main thread
-/// before parallel GRASP tasks dispatch, so worker threads never recompute
-/// Euclidean distances inside the iteration loop.
+/**
+ * @brief Per-round, broader distance cache.
+ *
+ * Covers every entity GRASP touches in a single round: all bakeries, every
+ * active customer, every drone's current position, and the base. Built once
+ * on the main thread before parallel GRASP dispatches, so worker threads
+ * never recompute Euclidean distances inside the iteration loop.
+ */
 class DistanceCache {
 public:
-	/// Rebuild the matrix for the given round snapshot.
+	/// Rebuild the matrix and id->index maps from the given round snapshot.
 	void build(const std::vector<Bakery>& bakeries,
 	           const std::vector<Customer>& customers,
 	           const std::vector<Drone>& drones,
 	           const Position& base_pos);
 
-	/// O(1) matrix lookup (caller must pass valid node indices).
+	/// O(1) matrix lookup; caller must pass valid node indices.
 	double dist(int a, int b) const noexcept { return matrix[a][b]; }
 
 	int bakery_node(int bakery_id) const;
@@ -55,9 +65,9 @@ public:
 
 private:
 	std::vector<std::vector<double>> matrix;
-	std::unordered_map<int, int> bakery_to_idx;
-	std::unordered_map<int, int> customer_to_idx;
-	std::unordered_map<int, int> drone_to_idx;
-	int base_idx = -1;
+	std::unordered_map<int, int>     bakery_to_idx;
+	std::unordered_map<int, int>     customer_to_idx;
+	std::unordered_map<int, int>     drone_to_idx;
+	int base_idx   = -1;
 	int node_count = 0;
 };

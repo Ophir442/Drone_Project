@@ -1,6 +1,20 @@
+/**
+ * @file simulation.cpp
+ * @brief Simulation pipeline, fleet auto-scaling, and two-phase commit.
+ *
+ * See simulation.h for the per-round pipeline overview. This file groups
+ * implementation into four sections:
+ *   - file-scope helpers (RNG seeding, contention resolution, route stamping)
+ *   - lifecycle  (constructor, validate_config, initialize, reset)
+ *   - per-drone motion and delivery event drain
+ *   - pipeline stages 1..4 plus the top-level run/step_round
+ */
+
 #include "simulation.h"
+
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -8,29 +22,39 @@
 
 namespace {
 
-constexpr double kRepositionEpsilon = 0.01;  ///< "already there" threshold
+constexpr double kRepositionEpsilon = 0.01;  ///< "already at the target" threshold
+constexpr double kPriorityCeiling   = 1e12;  ///< Cap on priority_weight to prevent NaN drift
 
-/// Build a fully-seeded Mersenne Twister. `std::random_device` provides
-/// non-deterministic entropy (on Linux: /dev/urandom); feeding it through
-/// `std::seed_seq` with eight draws fills mt19937's 19937-bit state
-/// properly instead of relying on the warm-up pattern that a single
-/// 32-bit seed produces. Called only from the main thread.
+/**
+ * @brief Build a fully-seeded Mersenne Twister.
+ *
+ * std::random_device provides non-deterministic entropy (on Linux:
+ * /dev/urandom); feeding it through std::seed_seq with eight draws fills
+ * mt19937's 19937-bit state properly instead of relying on the warm-up
+ * pattern that a single 32-bit seed produces. Called only from the main thread.
+ */
 std::mt19937 make_random_engine() {
 	std::random_device rd;
 	std::seed_seq seq{rd(), rd(), rd(), rd(), rd(), rd(), rd(), rd()};
 	return std::mt19937(seq);
 }
 
-/// Expected value of a discrete distribution given as (amount, prob) pairs.
+/// Expected value of a discrete (amount, prob) distribution.
 double expected_value(const std::vector<std::pair<int, double>>& distribution) {
 	double mean = 0.0;
 	for (const auto& [amount, prob] : distribution) mean += amount * prob;
 	return mean;
 }
 
-/// Gravity score = fullness / distance. Higher means more urgent to visit:
-/// a bakery near its ceiling will waste production if no drone arrives, so
-/// closeness * fullness wins over closeness alone.
+/**
+ * @brief Gravity score for an idle-drone repositioning target.
+ *
+ * Gravity = (current_inventory + expected_production) / capacity / max(distance, 1).
+ *
+ * Bakeries close to overflow attract idle drones — production that would
+ * otherwise be discarded by the capacity clamp becomes deliverable. Tiebreak
+ * toward closer targets.
+ */
 double calculate_gravity_score(const Bakery& bakery, double distance) {
 	if (bakery.capacity <= 0) {
 		return -std::numeric_limits<double>::infinity();
@@ -41,15 +65,24 @@ double calculate_gravity_score(const Bakery& bakery, double distance) {
 	return fullness / std::max(distance, 1.0);
 }
 
-/// Build a "go to bakery, pick up nothing" RouteNode used for repositioning.
+/// Construct a "go to bakery, pick up nothing" RouteNode for repositioning hops.
 RouteNode make_repositioning_hop(const Bakery& target) {
 	return {RouteNodeType::BAKERY_PICKUP, target.pos, target.id,
 	        /*customer_id*/ -1, /*bread_amount*/ 0, /*committed*/ false};
 }
 
-/// Bakery-side contention resolution: per bakery, sort intents by score
-/// desc and serve each its full request until the bakery runs out, then
-/// truncate / drop the rest. Mutates `bakeries[].current_inventory`.
+/**
+ * @brief Bakery-side phase-2 contention resolution.
+ *
+ * Group intents by bakery, sort each group by original_score descending, and
+ * serve each intent its full request until that bakery runs out — at which
+ * point remaining intents are truncated or dropped. Mutates the SHARED
+ * bakery inventory (the authoritative copy) so subsequent rounds see post-state.
+ *
+ * @c allocation receives one entry per customer_id: the final granted
+ * amount (0 = dropped). Only granted (give > 0) intents are pushed into
+ * @c resolved.
+ */
 void resolve_bakery_contention(
 	std::vector<Intent>& intents,
 	std::vector<Bakery>& bakeries,
@@ -73,7 +106,7 @@ void resolve_bakery_contention(
 			const int give = std::min(intent->requested_bread_amount, available);
 			assert(give >= 0);
 			assert(give <= available);
-			assert(give <= bakeries[bakery_id].capacity);     // Giant-Drone guard
+			assert(give <= bakeries[bakery_id].capacity);   // Giant-Drone guard
 			allocation[intent->customer_id] = give;
 			if (give > 0) {
 				available -= give;
@@ -87,9 +120,17 @@ void resolve_bakery_contention(
 	}
 }
 
-/// Walk the GRASP-optimized route and adjust node amounts to the resolved
-/// allocations. Truncated intents shrink, dropped intents disappear, and
-/// committed (already-executed) nodes pass through unchanged.
+/**
+ * @brief Rewrite a GRASP-optimized route to reflect post-contention amounts.
+ *
+ * Walks the planned route and, for each non-committed pickup/delivery whose
+ * customer appears in @p allocation:
+ *   - drops the node if the customer was fully dropped (allocation == 0),
+ *   - else stamps the smaller allocated amount.
+ *
+ * Committed nodes pass through unchanged — already-executed pickups and
+ * deliveries must never be rewritten retroactively.
+ */
 std::vector<RouteNode> apply_allocation_to_route(
 	const std::vector<RouteNode>& route,
 	const std::map<int, int>& allocation)
@@ -116,8 +157,7 @@ std::vector<RouteNode> apply_allocation_to_route(
 		if (it->second <= 0) continue;  // dropped — skip pickup AND delivery
 
 		// Allocation may shrink a node (truncated by contention), never grow
-		// it — a larger amount would invent bread the contention resolver
-		// never approved.
+		// it — a larger amount would invent bread the resolver never approved.
 		assert(it->second <= node.bread_amount);
 
 		RouteNode adjusted = node;
@@ -138,14 +178,25 @@ Simulation::Simulation(const SimConfig& config)
 
 /* ---------- validation ---------- */
 
-/// Throw on configurations that can never finish. Subtler shortages (slow
-/// drones, total supply < total demand) still surface only at runtime.
+/**
+ * @brief Reject configurations that would crash, hang, or NaN-propagate.
+ *
+ * Each guard prevents a concrete failure mode previously catalogued in the
+ * pessimistic-lens audits. Subtler shortages (slow drones overall, total
+ * supply < total demand) still surface only at runtime — those are
+ * legitimate stress scenarios, not config errors.
+ */
 void Simulation::validate_config() const {
 	if (config.customer_configs.empty()) {
 		throw std::runtime_error(
 			"Invalid config: customer_configs is empty — there is no one to deliver to.");
 	}
+	if (config.bakery_configs.empty()) {
+		throw std::runtime_error(
+			"Invalid config: bakery_configs is empty — no producers exist.");
+	}
 
+	// ---- drone template ----
 	if (config.drone_template.capacity_min <= 0) {
 		throw std::runtime_error(
 			"Invalid config: drone_template.capacity_min must be > 0 "
@@ -158,7 +209,45 @@ void Simulation::validate_config() const {
 			+ ") must be >= capacity_min ("
 			+ std::to_string(config.drone_template.capacity_min) + ").");
 	}
+	if (config.drone_template.velocity_min <= 0.0) {
+		throw std::runtime_error(
+			"Invalid config: drone_template.velocity_min must be > 0 "
+			"(got " + std::to_string(config.drone_template.velocity_min)
+			+ "). A zero-velocity drone divides by zero in route timing "
+			"and never advances physically.");
+	}
+	if (config.drone_template.velocity_max < config.drone_template.velocity_min) {
+		throw std::runtime_error(
+			"Invalid config: drone_template.velocity_max ("
+			+ std::to_string(config.drone_template.velocity_max)
+			+ ") must be >= velocity_min ("
+			+ std::to_string(config.drone_template.velocity_min) + ").");
+	}
 
+	// ---- algorithm parameters (division-by-zero in stage2_3_assignment) ----
+	if (config.thread_count <= 0) {
+		throw std::runtime_error(
+			"Invalid config: algorithm.thread_count must be >= 1 "
+			"(got " + std::to_string(config.thread_count) + ").");
+	}
+	if (config.grasp_iterations <= 0) {
+		throw std::runtime_error(
+			"Invalid config: algorithm.grasp_iterations must be >= 1 "
+			"(got " + std::to_string(config.grasp_iterations) + ").");
+	}
+	if (config.rcl_size <= 0) {
+		throw std::runtime_error(
+			"Invalid config: algorithm.rcl_size must be >= 1 "
+			"(got " + std::to_string(config.rcl_size) + ").");
+	}
+
+	// ---- simulation parameters ----
+	if (!std::isfinite(config.priority_increment) || config.priority_increment < 0.0) {
+		throw std::runtime_error(
+			"Invalid config: simulation.priority_increment must be finite and >= 0.");
+	}
+
+	// ---- bakeries: supply + probability sums ----
 	auto can_supply = [](const BakeryConfig& bc) {
 		if (bc.initial_inventory > 0) return true;
 		for (const auto& [amount, prob] : bc.production_distribution) {
@@ -166,7 +255,6 @@ void Simulation::validate_config() const {
 		}
 		return false;
 	};
-
 	const bool any_supply = std::any_of(
 		config.bakery_configs.begin(), config.bakery_configs.end(), can_supply);
 	if (!any_supply) {
@@ -177,12 +265,39 @@ void Simulation::validate_config() const {
 			"would never finish.");
 	}
 
-	// "Giant-Drone" deadlock prevention. A drone whose max payload exceeds
-	// *every* bakery's silo ceiling could be assigned an order it can never
-	// fill in one stop, and naive code that waits for the full pickup would
-	// deadlock. Runtime clamps in build_candidates() defuse this when it
-	// happens — but defensive programming says: refuse the config that
-	// makes it possible, so the failure mode is impossible by construction.
+	for (std::size_t i = 0; i < config.bakery_configs.size(); ++i) {
+		const auto& bc = config.bakery_configs[i];
+		if (bc.capacity <= 0) {
+			throw std::runtime_error(
+				"Invalid config: bakery " + std::to_string(i)
+				+ " has non-positive capacity (" + std::to_string(bc.capacity) + ").");
+		}
+		double prob_sum = 0.0;
+		for (const auto& [amount, prob] : bc.production_distribution) {
+			if (prob < 0.0 || prob > 1.0) {
+				throw std::runtime_error(
+					"Invalid config: bakery " + std::to_string(i)
+					+ " has a production_distribution probability outside [0,1]: "
+					+ std::to_string(prob) + ".");
+			}
+			prob_sum += prob;
+		}
+		if (!bc.production_distribution.empty() &&
+		    std::abs(prob_sum - 1.0) > 1e-6) {
+			throw std::runtime_error(
+				"Invalid config: bakery " + std::to_string(i)
+				+ " production_distribution probabilities sum to "
+				+ std::to_string(prob_sum) + ", expected 1.0.");
+		}
+	}
+
+	// ---- "Giant-Drone" deadlock prevention ----
+	// A drone whose max payload exceeds *every* bakery's silo ceiling could
+	// be assigned an order it can never fill in one stop, and naive code that
+	// waits for the full pickup would deadlock. Runtime clamps in
+	// build_candidates() defuse this when it happens — but defensive
+	// programming says: refuse the config that makes it possible, so the
+	// failure mode is impossible by construction.
 	int max_bakery_capacity = 0;
 	for (const BakeryConfig& bc : config.bakery_configs) {
 		if (bc.capacity > max_bakery_capacity) max_bakery_capacity = bc.capacity;
@@ -196,11 +311,29 @@ void Simulation::validate_config() const {
 			+ "). A spawned drone could be assigned an order no single bakery "
 			"can fill — risks the \"Giant-Drone\" deadlock.");
 	}
+
+	// ---- customers: zero-order phantoms livelock the queue ----
+	for (std::size_t i = 0; i < config.customer_configs.size(); ++i) {
+		if (config.customer_configs[i].order_quantity <= 0) {
+			throw std::runtime_error(
+				"Invalid config: customer " + std::to_string(i)
+				+ " has non-positive order_quantity ("
+				+ std::to_string(config.customer_configs[i].order_quantity)
+				+ "). A zero-order customer can never leave the priority queue.");
+		}
+	}
 }
 
 
-/* ---------- fleet management ---------- */
+/* ---------- fleet management (auto-scaling) ---------- */
 
+/**
+ * @brief Spawn a single drone from the configured template distribution.
+ *
+ * Velocity and capacity are drawn from the template ranges. validate_config
+ * has already established that velocity_min > 0 and capacity_min > 0, so the
+ * spawned drone is guaranteed safe to schedule.
+ */
 Drone Simulation::spawn_drone() {
 	const DroneTemplate& t = config.drone_template;
 	std::uniform_real_distribution<double> velocity_dist(t.velocity_min, t.velocity_max);
@@ -214,15 +347,22 @@ Drone Simulation::spawn_drone() {
 	d.max_capacity   = capacity_dist(rng);
 	d.route_progress = 0;
 	d.is_idle        = true;
+
+	assert(d.velocity     > 0.0);   // belt-and-suspenders against validate_config drift
+	assert(d.max_capacity > 0);
 	return d;
 }
 
-/// Organic supply/demand spawning: spawn iff bread exists to be moved AND
-/// the total fleet capacity is strictly less than total unassigned demand.
-/// The condition is self-bounding — the fleet stabilizes at exactly
-/// ceil(D_demand / drone.max_capacity) drones, so we need no headcount cap.
-/// Per-customer urgency is intentionally NOT considered here: priority_weight
-/// already steers the existing fleet through the GRASP score.
+/**
+ * @brief Organic supply/demand drone spawning.
+ *
+ * Spawns iff bread exists to be moved AND total fleet capacity is strictly
+ * less than total unassigned demand. The condition is self-bounding — the
+ * fleet stabilizes at exactly ceil(D_demand / drone.max_capacity) drones,
+ * so we need no headcount cap. Per-customer urgency is intentionally NOT
+ * considered here: priority_weight already steers the existing fleet through
+ * the GRASP score.
+ */
 bool Simulation::should_spawn_drone() const {
 	double D_demand = 0.0;
 	for (const Customer& c : get_all_customers()) {
@@ -314,6 +454,7 @@ void Simulation::reset() {
 
 void Simulation::add_customer(double x, double y, int order_quantity,
                               const std::string& /*name*/) {
+	if (order_quantity <= 0) return;  // silently ignore phantom orders
 	Customer c;
 	c.id              = next_customer_id++;
 	c.pos             = {x, y};
@@ -345,9 +486,17 @@ std::vector<Customer> Simulation::get_all_customers() const {
 
 /* ---------- per-drone motion ---------- */
 
-/// One velocity step toward the next route node. Pickups commit cargo
-/// immediately; deliveries queue an event so the priority_queue mutation
-/// stays on the main thread.
+/**
+ * @brief One velocity-step toward the next route node.
+ *
+ * If the drone is within one step of the target, it arrives and either
+ * commits a pickup (cargo += amount) or queues a delivery event (cargo -=
+ * amount). Delivery events are drained on the main thread by
+ * apply_delivery_events so the customer priority_queue stays single-writer.
+ *
+ * Marking the just-executed node as @c committed protects it from later
+ * mutation (allocation rewriting, 2-Opt reordering).
+ */
 void Simulation::advance_drone(Drone& drone) {
 	if (drone.planned_route.empty() ||
 	    drone.route_progress >= static_cast<int>(drone.planned_route.size())) {
@@ -362,6 +511,7 @@ void Simulation::advance_drone(Drone& drone) {
 	const double dist = DeliveryGraph::compute_distance(drone.current_pos, target.pos);
 
 	if (dist > drone.velocity) {
+		// Partial step: linearly interpolate toward the target.
 		const double ratio = drone.velocity / dist;
 		drone.current_pos.x += (target.pos.x - drone.current_pos.x) * ratio;
 		drone.current_pos.y += (target.pos.y - drone.current_pos.y) * ratio;
@@ -376,15 +526,13 @@ void Simulation::advance_drone(Drone& drone) {
 		target.committed   = true;
 		drone.current_load += target.bread_amount;
 	} else if (target.type == RouteNodeType::CUSTOMER_DELIVERY) {
-		// A delivery must never undershoot zero — drone has the cargo.
+		// A delivery must never undershoot zero — the drone must hold the cargo.
 		assert(target.bread_amount >= 0);
 		assert(drone.current_load >= target.bread_amount);
-		// Mark the delivery committed so that (a) apply_allocation_to_route
-		// doesn't rewrite an already-executed delivery's bread_amount when
-		// the customer is re-queued for partial fulfilment, and (b) 2-Opt's
+		// Commit the delivery so that (a) apply_allocation_to_route doesn't
+		// rewrite an already-executed delivery's bread_amount when the
+		// customer is re-queued for partial fulfilment, and (b) 2-Opt's
 		// first_mutable correctly excludes it from the reorderable suffix.
-		// Without this flag, stale delivery nodes can be shuffled into the
-		// live route and trigger phantom deliveries with empty cargo.
 		target.committed   = true;
 		drone.current_load -= target.bread_amount;
 		drone.pending_deliveries.push_back({target.entity_id, target.bread_amount});
@@ -394,17 +542,18 @@ void Simulation::advance_drone(Drone& drone) {
 	drone.route_progress++;
 }
 
-/// Drain queued delivery events into the customer queue. Single-threaded:
-/// std::priority_queue is not thread-safe.
+/**
+ * @brief Drain queued delivery events into the customer priority queue.
+ *
+ * Single-threaded: std::priority_queue is not thread-safe and the workers
+ * accumulate DeliveryEvents into per-drone buffers during stage 1.
+ */
 void Simulation::apply_delivery_events() {
 	served_this_round.clear();
 
 	std::map<int, int> delivered;
 	for (Drone& d : drones) {
 		for (const DeliveryEvent& ev : d.pending_deliveries) {
-			// A delivery event is only enqueued from a committed delivery
-			// node whose bread_amount we already asserted >= 0; this guards
-			// against future code paths inventing negative deliveries.
 			assert(ev.bread_delivered >= 0);
 			delivered[ev.customer_id] += ev.bread_delivered;
 			total_bread_delivered     += ev.bread_delivered;
@@ -436,12 +585,21 @@ void Simulation::apply_delivery_events() {
 
 /* ---------- pipeline ---------- */
 
-/// Stage 1: bakery production + drone motion in parallel; post-step
-/// bookkeeping (delivery events, priority increments) on the main thread.
+/**
+ * @brief Stage 1: parallel state update.
+ *
+ * Bakery production (a stochastic sample from each bakery's distribution) and
+ * drone motion (one velocity-step along each planned route) run concurrently
+ * on the thread pool. Post-step bookkeeping — delivery event drain and
+ * priority increment for unserved customers — runs on the main thread to
+ * keep the priority_queue single-writer.
+ *
+ * Each bakery worker gets its own RNG seeded off the main RNG; the master
+ * std::mt19937 must not be shared across worker threads.
+ */
 void Simulation::stage1_state_update() {
 	std::vector<std::future<void>> futures;
 
-	// One RNG per bakery — workers must not share the master rng.
 	std::vector<std::mt19937> bakery_rngs;
 	bakery_rngs.reserve(bakeries.size());
 	for (std::size_t i = 0; i < bakeries.size(); ++i) bakery_rngs.emplace_back(rng());
@@ -459,6 +617,8 @@ void Simulation::stage1_state_update() {
 					break;
 				}
 			}
+			assert(bakeries[i].current_inventory >= 0);
+			assert(bakeries[i].current_inventory <= bakeries[i].capacity);
 		}));
 	}
 
@@ -469,18 +629,28 @@ void Simulation::stage1_state_update() {
 
 	apply_delivery_events();
 
-	// Customers not served this round get +priority_increment.
+	// Priority bookkeeping: customers not served this round get
+	// +priority_increment, capped at kPriorityCeiling to prevent unbounded
+	// growth (which could eventually produce NaN-tainted GRASP scores).
 	std::vector<Customer> customers = get_all_customers();
 	while (!customer_queue.empty()) customer_queue.pop();
 	for (Customer c : customers) {
-		if (!served_this_round.count(c.id)) c.priority_weight += config.priority_increment;
+		if (!served_this_round.count(c.id)) {
+			c.priority_weight += config.priority_increment;
+			if (c.priority_weight > kPriorityCeiling) c.priority_weight = kPriorityCeiling;
+		}
 		customer_queue.push(c);
 	}
 }
 
-/// Stages 2-3: parallel GRASP. The distance matrix is built once on the
-/// main thread (no OMP, so the custom ThreadPool isn't oversubscribed);
-/// each worker runs its share of iterations on private snapshots.
+/**
+ * @brief Stages 2-3: parallel GRASP.
+ *
+ * The DistanceCache is built once on the main thread so workers never touch
+ * shared state when computing route times. The configured iteration budget
+ * is split as evenly as possible across worker threads; each thread keeps
+ * only its best-scoring solution, and the main thread reduces across them.
+ */
 GraspSolution Simulation::stage2_3_assignment() {
 	std::vector<Customer> customers;
 	for (const Customer& c : get_all_customers()) {
@@ -496,6 +666,7 @@ GraspSolution Simulation::stage2_3_assignment() {
 
 	const int total_iters = config.grasp_iterations;
 	const int num_threads = std::min(config.thread_count, total_iters);
+	if (num_threads <= 0) return {};  // belt-and-suspenders; validate_config blocks this
 
 	std::vector<std::mt19937> thread_rngs;
 	thread_rngs.reserve(num_threads);
@@ -503,7 +674,7 @@ GraspSolution Simulation::stage2_3_assignment() {
 
 	struct ThreadResult {
 		GraspSolution solution;
-		double score = -1.0;
+		double        score = -1.0;
 	};
 
 	std::vector<std::future<ThreadResult>> futures;
@@ -543,8 +714,19 @@ GraspSolution Simulation::stage2_3_assignment() {
 	return best;
 }
 
-/// Stage 4: resolve contention, stamp final amounts onto each drone's
-/// route, then send any remaining idle drone toward a high-gravity bakery.
+/**
+ * @brief Stage 4: two-phase commit + idle-drone repositioning.
+ *
+ * Phase 2 of two-phase commit:
+ *   1. resolve_bakery_contention reconciles the per-thread intent promises
+ *      against the real shared inventory, score-first, and returns the
+ *      authoritative allocation.
+ *   2. apply_allocation_to_route rewrites each drone's planned route to
+ *      reflect the truncated/dropped amounts.
+ *   3. Truly idle drones (not assigned any new work and with no remaining
+ *      route) are sent toward the highest-gravity bakery so future
+ *      production isn't wasted on a full silo.
+ */
 void Simulation::stage4_commit(GraspSolution& solution) {
 	std::vector<Intent> resolved;
 	std::map<int, int>  allocation;
@@ -572,8 +754,9 @@ void Simulation::stage4_commit(GraspSolution& solution) {
 
 /* ---------- idle repositioning ---------- */
 
-/// Pick the bakery with the highest Gravity Score from this drone's
-/// current position. Returns nullptr if there are no bakeries.
+/// Pick the bakery with the highest gravity score from this drone's current
+/// position. Returns nullptr if there are no bakeries (defensive: validate_config
+/// blocks that, but the read-only contract is worth preserving).
 const Bakery* Simulation::choose_repositioning_target(const Drone& drone) const {
 	const Bakery* best = nullptr;
 	double best_score  = -std::numeric_limits<double>::infinity();
@@ -588,7 +771,7 @@ const Bakery* Simulation::choose_repositioning_target(const Drone& drone) const 
 	return best;
 }
 
-/// Send each truly-idle drone to its highest-gravity bakery so that
+/// Send each truly-idle drone toward its highest-gravity bakery so that
 /// stochastic production isn't wasted on a full silo.
 void Simulation::reposition_idle_drones(const std::set<int>& assigned_drone_ids) {
 	if (bakeries.empty()) return;
@@ -612,6 +795,16 @@ void Simulation::reposition_idle_drones(const std::set<int>& assigned_drone_ids)
 
 /* ---------- top level ---------- */
 
+/**
+ * @brief Run a single round of the four-stage pipeline.
+ *
+ * Termination conditions, in order:
+ *   1. All customers served AND all drones idle  → return false (normal end).
+ *   2. No bakery has stock, none can ever produce, no drone is carrying
+ *      cargo, AND customers remain → return false with a halt message.
+ *      Without this clause the loop livelocks forever in an impossible state.
+ *   3. Otherwise → return true.
+ */
 bool Simulation::step_round() {
 	maybe_spawn_drone();
 	stage1_state_update();
@@ -624,6 +817,31 @@ bool Simulation::step_round() {
 			[](const Drone& d) { return d.is_idle; });
 		if (all_idle) return false;
 	}
+
+	// Dead-end detection: if every bakery is at zero inventory, no bakery
+	// can ever produce a positive amount, and no drone is carrying cargo,
+	// the remaining demand can never be satisfied. Continuing would livelock.
+	int total_inventory = 0;
+	int total_in_flight = 0;
+	for (const Bakery& b : bakeries) total_inventory += b.current_inventory;
+	for (const Drone&  d : drones)   total_in_flight += d.current_load;
+
+	auto can_ever_produce = [](const Bakery& b) {
+		for (const auto& [amount, prob] : b.production_distribution) {
+			if (amount > 0 && prob > 0.0) return true;
+		}
+		return false;
+	};
+	const bool any_producer = std::any_of(
+		bakeries.begin(), bakeries.end(), can_ever_produce);
+
+	if (total_inventory == 0 && total_in_flight == 0 && !any_producer &&
+	    !customer_queue.empty()) {
+		std::cerr << "\n  Halting: no bread can ever reach "
+		          << customer_queue.size() << " remaining customer(s).\n";
+		return false;
+	}
+
 	return true;
 }
 

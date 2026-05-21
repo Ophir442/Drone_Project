@@ -1,14 +1,23 @@
-#include "http_server.h"
-#include <nlohmann/json.hpp>
-#include <iostream>
-#include <sstream>
-#include <cstring>
-#include <unistd.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
+/**
+ * @file http_server.cpp
+ * @brief Blocking single-threaded HTTP/1.1 façade over the Simulation.
+ *
+ * See http_server.h for the endpoint surface. handle_client() runs on the
+ * server thread synchronously — there is intentionally no per-client
+ * worker, so Simulation mutations are serialized by the accept loop.
+ */
 
-using namespace std;
+#include "http_server.h"
+
+#include <arpa/inet.h>
+#include <cstring>
+#include <iostream>
+#include <netinet/in.h>
+#include <nlohmann/json.hpp>
+#include <sstream>
+#include <sys/socket.h>
+#include <unistd.h>
+
 using json = nlohmann::json;
 
 HttpServer::HttpServer(Simulation& sim, int port)
@@ -20,56 +29,60 @@ HttpServer::~HttpServer() {
 
 void HttpServer::start() {
 	running = true;
-	server_thread = thread(&HttpServer::run_server, this);
+	server_thread = std::thread(&HttpServer::run_server, this);
 }
 
 void HttpServer::stop() {
 	running = false;
-	if (server_fd >= 0) {
-		shutdown(server_fd, SHUT_RDWR);
-		close(server_fd);
-		server_fd = -1;
+	const int fd = server_fd.exchange(-1);
+	if (fd >= 0) {
+		shutdown(fd, SHUT_RDWR);
+		close(fd);
 	}
 	if (server_thread.joinable()) server_thread.join();
 }
 
 void HttpServer::run_server() {
-	server_fd = socket(AF_INET, SOCK_STREAM, 0);
-	if (server_fd < 0) {
-		cerr << "Failed to create socket" << endl;
+	const int fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0) {
+		std::cerr << "Failed to create socket" << std::endl;
 		return;
 	}
+	server_fd.store(fd);
 
 	int opt = 1;
-	setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
 	sockaddr_in addr{};
-	addr.sin_family = AF_INET;
+	addr.sin_family      = AF_INET;
 	addr.sin_addr.s_addr = INADDR_ANY;
-	addr.sin_port = htons(port);
+	addr.sin_port        = htons(port);
 
-	if (bind(server_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-		cerr << "Failed to bind to port " << port << endl;
-		close(server_fd);
-		server_fd = -1;
+	if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+		std::cerr << "Failed to bind to port " << port << std::endl;
+		close(fd);
+		server_fd.store(-1);
 		return;
 	}
 
-	if (listen(server_fd, 10) < 0) {
-		cerr << "Failed to listen" << endl;
-		close(server_fd);
-		server_fd = -1;
+	if (listen(fd, 10) < 0) {
+		std::cerr << "Failed to listen" << std::endl;
+		close(fd);
+		server_fd.store(-1);
 		return;
 	}
 
-	cout << "HTTP server listening on port " << port << endl;
+	std::cout << "HTTP server listening on port " << port << std::endl;
 
-	while (running) {
+	// INVARIANT: handle_client must be called synchronously here.
+	// Spawning a per-client worker would race Simulation's internal state.
+	while (running.load()) {
 		sockaddr_in client_addr{};
-		socklen_t client_len = sizeof(client_addr);
-		int client_fd = accept(server_fd, reinterpret_cast<sockaddr*>(&client_addr), &client_len);
+		socklen_t   client_len = sizeof(client_addr);
+		const int client_fd = accept(fd,
+			reinterpret_cast<sockaddr*>(&client_addr), &client_len);
 		if (client_fd < 0) {
-			if (running) cerr << "Accept failed" << endl;
+			if (running.load()) std::cerr << "Accept failed" << std::endl;
 			continue;
 		}
 		handle_client(client_fd);
@@ -78,20 +91,19 @@ void HttpServer::run_server() {
 
 void HttpServer::handle_client(int client_fd) {
 	char buffer[8192];
-	memset(buffer, 0, sizeof(buffer));
-	ssize_t bytes = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
+	std::memset(buffer, 0, sizeof(buffer));
+	const ssize_t bytes = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
 	if (bytes <= 0) {
 		close(client_fd);
 		return;
 	}
 
-	string request(buffer, bytes);
-	string method = parse_method(request);
-	string path   = parse_path(request);
-	string body   = parse_body(request);
+	const std::string request(buffer, bytes);
+	const std::string method = parse_method(request);
+	const std::string path   = parse_path(request);
+	const std::string body   = parse_body(request);
 
-	string response;
-
+	std::string response;
 	if (method == "OPTIONS") {
 		response = make_response(200, "");
 	} else if (path == "/api/state" && method == "GET") {
@@ -116,7 +128,7 @@ void HttpServer::handle_client(int client_fd) {
 	close(client_fd);
 }
 
-string HttpServer::handle_get_state() {
+std::string HttpServer::handle_get_state() {
 	json state;
 	state["round"] = sim.get_round();
 	state["base"]  = {{"x", sim.get_base_pos().x}, {"y", sim.get_base_pos().y}};
@@ -190,8 +202,8 @@ string HttpServer::handle_get_state() {
 	return state.dump();
 }
 
-string HttpServer::handle_step() {
-	bool can_continue = sim.step_round();
+std::string HttpServer::handle_step() {
+	const bool can_continue = sim.step_round();
 	json result;
 	result["continued"] = can_continue;
 	result["round"]     = sim.get_round();
@@ -199,43 +211,50 @@ string HttpServer::handle_step() {
 	return result.dump();
 }
 
-string HttpServer::handle_add_customer(const string& body) {
+std::string HttpServer::handle_add_customer(const std::string& body) {
 	try {
 		json j = json::parse(body);
-		double x       = j.value("x", 50.0);
-		double y       = j.value("y", 50.0);
-		int qty        = j.value("order_quantity", 3);
-		string name    = j.value("name", "");
+		const double x      = j.value("x", 50.0);
+		const double y      = j.value("y", 50.0);
+		const int    qty    = j.value("order_quantity", 3);
+		const std::string name = j.value("name", "");
+		if (qty <= 0) {
+			return json({{"success", false},
+			             {"error", "order_quantity must be > 0"}}).dump();
+		}
 		sim.add_customer(x, y, qty, name);
 		return json({{"success", true}, {"message", "Customer added"}}).dump();
-	} catch (const exception& e) {
+	} catch (const std::exception& e) {
 		return json({{"success", false}, {"error", e.what()}}).dump();
 	}
 }
 
-string HttpServer::handle_remove_customer(const string& body) {
+std::string HttpServer::handle_remove_customer(const std::string& body) {
 	try {
 		json j = json::parse(body);
-		int id = j.value("id", -1);
-		if (id < 0) return json({{"success", false}, {"error", "Invalid customer ID"}}).dump();
+		const int id = j.value("id", -1);
+		if (id < 0) {
+			return json({{"success", false},
+			             {"error", "Invalid customer ID"}}).dump();
+		}
 		sim.remove_customer(id);
 		return json({{"success", true}, {"message", "Customer removed"}}).dump();
-	} catch (const exception& e) {
+	} catch (const std::exception& e) {
 		return json({{"success", false}, {"error", e.what()}}).dump();
 	}
 }
 
-string HttpServer::handle_initialize() {
+std::string HttpServer::handle_initialize() {
 	sim.initialize();
 	return handle_get_state();
 }
 
-string HttpServer::handle_reset() {
+std::string HttpServer::handle_reset() {
 	sim.reset();
 	return handle_get_state();
 }
 
-string HttpServer::handle_config() {
+std::string HttpServer::handle_config() {
 	const auto& cfg = sim.get_config();
 	json j;
 	j["grid_width"]         = cfg.grid_width;
@@ -253,21 +272,21 @@ string HttpServer::handle_config() {
 	return j.dump();
 }
 
-string HttpServer::make_cors_headers() {
+std::string HttpServer::make_cors_headers() {
 	return "Access-Control-Allow-Origin: *\r\n"
 	       "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n"
 	       "Access-Control-Allow-Headers: Content-Type\r\n";
 }
 
-string HttpServer::make_response(int status, const string& body) {
-	string status_text;
+std::string HttpServer::make_response(int status, const std::string& body) {
+	std::string status_text;
 	switch (status) {
 		case 200: status_text = "OK";        break;
 		case 404: status_text = "Not Found"; break;
 		default:  status_text = "Unknown";   break;
 	}
 
-	ostringstream ss;
+	std::ostringstream ss;
 	ss << "HTTP/1.1 " << status << " " << status_text << "\r\n"
 	   << make_cors_headers()
 	   << "Content-Type: application/json\r\n"
@@ -277,25 +296,25 @@ string HttpServer::make_response(int status, const string& body) {
 	return ss.str();
 }
 
-string HttpServer::parse_method(const string& request) {
-	auto space = request.find(' ');
-	if (space == string::npos) return "";
+std::string HttpServer::parse_method(const std::string& request) {
+	const auto space = request.find(' ');
+	if (space == std::string::npos) return "";
 	return request.substr(0, space);
 }
 
-string HttpServer::parse_path(const string& request) {
-	auto first = request.find(' ');
-	if (first == string::npos) return "";
-	auto second = request.find(' ', first + 1);
-	if (second == string::npos) return "";
-	string path = request.substr(first + 1, second - first - 1);
-	auto q = path.find('?');
-	if (q != string::npos) path = path.substr(0, q);
+std::string HttpServer::parse_path(const std::string& request) {
+	const auto first = request.find(' ');
+	if (first == std::string::npos) return "";
+	const auto second = request.find(' ', first + 1);
+	if (second == std::string::npos) return "";
+	std::string path = request.substr(first + 1, second - first - 1);
+	const auto q = path.find('?');
+	if (q != std::string::npos) path = path.substr(0, q);
 	return path;
 }
 
-string HttpServer::parse_body(const string& request) {
-	auto pos = request.find("\r\n\r\n");
-	if (pos == string::npos) return "";
+std::string HttpServer::parse_body(const std::string& request) {
+	const auto pos = request.find("\r\n\r\n");
+	if (pos == std::string::npos) return "";
 	return request.substr(pos + 4);
 }

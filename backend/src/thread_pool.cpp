@@ -1,27 +1,27 @@
+/**
+ * @file thread_pool.cpp
+ * @brief Worker-thread loop and shutdown for ThreadPool.
+ *
+ * The worker loop drains @c tasks until @c stop is set AND the queue is empty.
+ * Tasks queued before shutdown are completed before the worker exits, so a
+ * caller still holding a future can safely call get().
+ */
+
 #include "thread_pool.h"
 
-using namespace std;
-
-ThreadPool::ThreadPool(size_t num_threads) : stop(false), active_tasks(0) {
-	for (size_t i = 0; i < num_threads; ++i) {
+ThreadPool::ThreadPool(std::size_t num_threads) : stop(false) {
+	for (std::size_t i = 0; i < num_threads; ++i) {
 		workers.emplace_back([this] {
 			while (true) {
-				function<void()> task;
+				std::function<void()> task;
 				{
-					unique_lock<mutex> lock(queue_mutex);
+					std::unique_lock<std::mutex> lock(queue_mutex);
 					condition.wait(lock, [this] { return stop || !tasks.empty(); });
 					if (stop && tasks.empty()) return;
-					task = move(tasks.front());
+					task = std::move(tasks.front());
 					tasks.pop();
 				}
 				task();
-				{
-					unique_lock<mutex> lock(queue_mutex);
-					active_tasks--;
-					if (active_tasks == 0 && tasks.empty()) {
-						done_condition.notify_all();
-					}
-				}
 			}
 		});
 	}
@@ -29,16 +29,9 @@ ThreadPool::ThreadPool(size_t num_threads) : stop(false), active_tasks(0) {
 
 ThreadPool::~ThreadPool() {
 	{
-		unique_lock<mutex> lock(queue_mutex);
+		std::unique_lock<std::mutex> lock(queue_mutex);
 		stop = true;
 	}
 	condition.notify_all();
 	for (auto& worker : workers) worker.join();
-}
-
-void ThreadPool::wait_all() {
-	unique_lock<mutex> lock(queue_mutex);
-	done_condition.wait(lock, [this] {
-		return active_tasks == 0 && tasks.empty();
-	});
 }

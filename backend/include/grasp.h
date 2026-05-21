@@ -1,33 +1,60 @@
 #pragma once
 
-#include "types.h"
 #include "distance.h"
-#include <vector>
-#include <random>
+#include "types.h"
 #include <map>
+#include <random>
+#include <vector>
 
-/// Result of `find_best_bakery`: which bakery and how much it can supply.
+/// Result of GraspSolver::find_best_bakery: which bakery, and how much it
+/// can supply for the customer this iteration.
 struct BakeryAssignment {
 	int bakery_id;
 	int achievable_amount;
 };
 
-/// Output of a single GRASP iteration.
+/// One iteration's complete output: a flat list of intents plus the
+/// per-drone planned routes those intents implied.
 struct GraspSolution {
-	std::vector<Intent> intents;
+	std::vector<Intent>                   intents;
 	std::map<int, std::vector<RouteNode>> drone_routes;
 };
 
-/// Greedy-randomized adaptive search for drone↔customer assignment.
-/// Each iteration builds one solution by sampling from a restricted
-/// candidate list (RCL), then improves the resulting routes with 2-Opt.
+/**
+ * @brief Greedy Randomized Adaptive Search Procedure for drone↔customer assignment.
+ *
+ * Each iteration builds one feasible solution by sampling from a Restricted
+ * Candidate List (RCL) and then improves the resulting per-drone routes with
+ * 2-Opt. Multiple iterations explore different neighborhoods of the
+ * assignment space; the best-scoring solution wins.
+ *
+ * The solver is thread-safe given per-thread snapshots of @c drones and
+ * @c bakeries plus a per-thread @c std::mt19937. The @c DistanceCache is
+ * shared read-only across threads.
+ */
 class GraspSolver {
 public:
+	/**
+	 * @brief Construct a solver bound to a static delivery graph.
+	 * @param graph      static bakery+base distance graph (read-only).
+	 * @param rcl_size   maximum size of the Restricted Candidate List per customer.
+	 * @param iterations total iterations to run across all threads (informational).
+	 */
 	GraspSolver(const DeliveryGraph& graph, int rcl_size, int iterations);
 
-	/// Run one GRASP iteration on a private snapshot of state.
-	/// Thread-safe given private copies of `drones` / `bakeries` and a
-	/// thread-local `rng`. `cache` is shared (read-only) across threads.
+	/**
+	 * @brief Build one feasible solution and improve it with 2-Opt.
+	 *
+	 * Operates on private snapshots of @p drones and @p bakeries — the
+	 * caller is responsible for cloning state per worker thread.
+	 *
+	 * @param customers active (unassigned) customer set, max-priority first.
+	 * @param drones    per-thread snapshot of the fleet.
+	 * @param bakeries  per-thread snapshot of inventory levels.
+	 * @param base_pos  depot position used for return-leg time estimation.
+	 * @param cache     shared per-round distance cache (read-only).
+	 * @param rng       thread-local Mersenne Twister.
+	 */
 	GraspSolution run_single_iteration(
 		const std::vector<Customer>& customers,
 		const std::vector<Drone>& drones,
@@ -36,11 +63,11 @@ public:
 		const DistanceCache& cache,
 		std::mt19937& rng);
 
-	/// Sum of per-intent scores; higher = better assignment.
+	/// Sum of per-intent original_scores; higher = better assignment.
 	static double evaluate_solution(const std::vector<Intent>& intents);
 
 private:
-	/// A single (drone, bakery, amount) option considered for one customer.
+	/// A single (drone, bakery, amount) option for one customer.
 	struct Candidate {
 		int    drone_idx;
 		int    bakery_id;

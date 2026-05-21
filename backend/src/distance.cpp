@@ -1,8 +1,20 @@
+/**
+ * @file distance.cpp
+ * @brief Symmetric Euclidean matrices for the simulation's two distance views.
+ *
+ * DeliveryGraph is a small per-run matrix (bakeries + base). DistanceCache is
+ * a per-round superset that also includes the active customer set and the
+ * current drone positions, so GRASP workers can resolve any pair via a flat
+ * table lookup rather than an on-the-fly sqrt.
+ */
+
 #include "distance.h"
+
+#include <cassert>
 
 namespace {
 
-/// Fill a symmetric Euclidean distance matrix from a list of positions.
+/// Fill a symmetric n×n Euclidean matrix from @p positions. Diagonal is 0.
 void fill_symmetric_matrix(const std::vector<Position>& positions,
                            std::vector<std::vector<double>>& matrix) {
 	const int n = static_cast<int>(positions.size());
@@ -33,6 +45,8 @@ void DeliveryGraph::initialize(const std::vector<Bakery>& bakeries,
 }
 
 double DeliveryGraph::get_static_distance(int from_node, int to_node) const {
+	assert(from_node >= 0 && from_node < node_count);
+	assert(to_node   >= 0 && to_node   < node_count);
 	return adjacency_matrix[from_node][to_node];
 }
 
@@ -62,7 +76,7 @@ void DistanceCache::build(const std::vector<Bakery>& bakeries,
 	std::vector<Position> positions;
 	positions.reserve(bakeries.size() + customers.size() + drones.size() + 1);
 
-	// Generic registration: assign the next free index to an entity and stash its position.
+	// Assign the next free index to an entity and stash its position.
 	auto register_entity = [&positions](auto& map, int id, const Position& pos) {
 		map[id] = static_cast<int>(positions.size());
 		positions.push_back(pos);

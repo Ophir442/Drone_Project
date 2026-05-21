@@ -1,28 +1,43 @@
-#include "simulation.h"
+/**
+ * @file main.cpp
+ * @brief Entry point: parse CLI, load config.json, run sim or HTTP server.
+ *
+ * The shutdown path is intentionally signal-safe: the SIGINT/SIGTERM
+ * handler does nothing but flip an atomic flag. The main thread polls the
+ * flag and performs the actual teardown (joins, iostream, exit) outside the
+ * signal context, where iostream and joins are legal.
+ */
+
 #include "http_server.h"
-#include <nlohmann/json.hpp>
-#include <fstream>
-#include <iostream>
-#include <thread>
+#include "simulation.h"
+
+#include <atomic>
 #include <chrono>
 #include <csignal>
+#include <fstream>
+#include <iostream>
+#include <nlohmann/json.hpp>
+#include <thread>
 
-using namespace std;
 using nlohmann::json;
 
-static HttpServer* global_server = nullptr;
+namespace {
 
-void signal_handler(int) {
-	if (global_server) global_server->stop();
-	cout << "\nServer stopped." << endl;
-	exit(0);
+/// Set by the signal handler; polled by main() to trigger graceful shutdown.
+std::atomic<bool> g_shutdown_requested{false};
+
+/// Async-signal-safe: writes one atomic. No iostream, no joins, no exit().
+extern "C" void signal_handler(int /*sig*/) {
+	g_shutdown_requested.store(true, std::memory_order_relaxed);
 }
 
-SimConfig load_config(const string& path) {
-	ifstream file(path);
+/// Parse config.json into a fully-populated SimConfig. Throws on parse
+/// errors; semantic validation is deferred to Simulation::validate_config.
+SimConfig load_config(const std::string& path) {
+	std::ifstream file(path);
 	if (!file.is_open()) {
-		cerr << "ERROR: Config file not found at " << path << "\n";
-		exit(1);
+		std::cerr << "ERROR: Config file not found at " << path << "\n";
+		std::exit(1);
 	}
 
 	json j;
@@ -42,7 +57,7 @@ SimConfig load_config(const string& path) {
 	const auto& algo = j.at("algorithm");
 	config.grasp_iterations = algo.value("grasp_iterations", 5);
 	config.rcl_size         = algo.value("rcl_size", 3);
-	int hw = static_cast<int>(thread::hardware_concurrency());
+	const int hw = static_cast<int>(std::thread::hardware_concurrency());
 	config.thread_count     = algo.value("thread_count", hw > 0 ? hw : 4);
 
 	const auto& dt = j.at("drone_template");
@@ -59,7 +74,8 @@ SimConfig load_config(const string& path) {
 		bc.capacity          = jb.value("capacity", 50);
 		bc.initial_inventory = jb.value("initial_inventory", 25);
 		for (const auto& entry : jb.at("production_distribution")) {
-			bc.production_distribution.push_back({entry[0].get<int>(), entry[1].get<double>()});
+			bc.production_distribution.push_back(
+				{entry[0].get<int>(), entry[1].get<double>()});
 		}
 		config.bakery_configs.push_back(bc);
 	}
@@ -77,42 +93,58 @@ SimConfig load_config(const string& path) {
 	return config;
 }
 
-int main(int argc, char* argv[]) {
-	string config_path = "config.json";
-	bool server_mode = false;
-	int port = 8080;
+/// Parse CLI args: positional path, --server/-s, --port/-p N.
+struct CliArgs {
+	std::string config_path = "config.json";
+	bool        server_mode = false;
+	int         port        = 8080;
+};
 
+CliArgs parse_cli(int argc, char* argv[]) {
+	CliArgs args;
 	for (int i = 1; i < argc; ++i) {
-		string arg = argv[i];
+		const std::string arg = argv[i];
 		if (arg == "--server" || arg == "-s") {
-			server_mode = true;
+			args.server_mode = true;
 		} else if (arg == "--port" || arg == "-p") {
-			if (i + 1 < argc) port = stoi(argv[++i]);
+			if (i + 1 < argc) args.port = std::stoi(argv[++i]);
 		} else {
-			config_path = arg;
+			args.config_path = arg;
 		}
 	}
+	return args;
+}
 
-	SimConfig config = load_config(config_path);
+}  // namespace
 
-	if (server_mode) {
+
+int main(int argc, char* argv[]) {
+	const CliArgs args = parse_cli(argc, argv);
+
+	SimConfig config = load_config(args.config_path);
+
+	if (args.server_mode) {
 		Simulation sim(config);
 		sim.initialize();
 
-		HttpServer server(sim, port);
-		global_server = &server;
-		signal(SIGINT, signal_handler);
-		signal(SIGTERM, signal_handler);
+		HttpServer server(sim, args.port);
+		std::signal(SIGINT,  signal_handler);
+		std::signal(SIGTERM, signal_handler);
 
-		cout << "Starting in server mode on port " << port << endl;
-		cout << "Press Ctrl+C to stop." << endl;
+		std::cout << "Starting in server mode on port " << args.port << "\n";
+		std::cout << "Press Ctrl+C to stop.\n";
 		server.start();
 
-		while (true) this_thread::sleep_for(chrono::seconds(1));
-	} else {
-		Simulation sim(config);
-		sim.run();
+		while (!g_shutdown_requested.load(std::memory_order_relaxed)) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(200));
+		}
+
+		std::cout << "\nShutting down…" << std::endl;
+		server.stop();
+		return 0;
 	}
 
+	Simulation sim(config);
+	sim.run();
 	return 0;
 }
