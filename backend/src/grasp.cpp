@@ -1,7 +1,7 @@
 #include "grasp.h"
 #include <algorithm>
+#include <cassert>
 #include <limits>
-#include <set>
 
 namespace {
 
@@ -150,6 +150,15 @@ BakeryAssignment GraspSolver::find_best_bakery(
 			}
 		}
 	}
+
+	// Postcondition: a returned amount is always physically realisable
+	// by a single visit to the chosen bakery.
+	if (best.bakery_id >= 0) {
+		const Bakery& b = bakeries[best.bakery_id];
+		assert(best.achievable_amount >= 0);
+		assert(best.achievable_amount <= b.current_inventory);
+		assert(best.achievable_amount <= b.capacity);
+	}
 	return best;
 }
 
@@ -172,13 +181,27 @@ std::vector<GraspSolver::Candidate> GraspSolver::build_candidates(
 		const BakeryAssignment ba = find_best_bakery(drone, customer, bakeries, base_pos);
 		if (ba.bakery_id < 0 || ba.achievable_amount <= 0) continue;
 
-		// Order splitting: take whatever fits in remaining capacity rather
-		// than rejecting the drone for not covering the whole order.
-		const int amount_to_take = std::min(
-			ba.achievable_amount, drone.max_capacity - future_load(drone));
+		const Bakery& bakery = bakeries[ba.bakery_id];
+
+		// Defensive triple-clamp on a single pickup amount:
+		//   - achievable_amount : what find_best_bakery already vetted
+		//   - bakery.capacity   : the absolute ceiling the bakery can ever hold
+		//                         (blocks the "Giant Drone" deadlock — a drone
+		//                         can never wait for bread the bakery is
+		//                         physically incapable of producing in stock)
+		//   - drone free cap    : remaining payload on this drone
+		// Order splitting then handles the residual on subsequent rounds.
+		const int amount_to_take = std::min({
+			ba.achievable_amount,
+			bakery.capacity,
+			drone.max_capacity - future_load(drone)
+		});
 		if (amount_to_take <= 0) continue;
 
-		const Bakery& bakery = bakeries[ba.bakery_id];
+		assert(amount_to_take > 0);
+		assert(amount_to_take <= bakery.capacity);
+		assert(amount_to_take <= bakery.current_inventory);
+		assert(amount_to_take <= drone.max_capacity - future_load(drone));
 		const double t_with    = compute_route_time_with_assignment(
 			drone, bakery, customer, amount_to_take, base_pos);
 		const double t_without = compute_route_time(drone, base_pos);
@@ -196,17 +219,25 @@ std::vector<GraspSolver::Candidate> GraspSolver::build_candidates(
 
 /* ---------- 2-Opt ---------- */
 
-/// A delivery for customer C must be preceded by a pickup tagged with the same
-/// customer_id. Required because 2-Opt may reverse a segment that crosses a
-/// pickup→delivery pair, which would otherwise yield an unservable route.
+/// Per-customer cargo-balance check. Each pickup adds to that customer's
+/// running balance, each delivery subtracts; the balance must never go
+/// negative. Stricter than a simple pickup-before-delivery set, and required
+/// because a drone's route can legitimately contain *multiple* pickup/delivery
+/// pairs for the same customer (e.g. after a partial-fulfilment re-assignment
+/// across rounds). With only a presence-set check, 2-Opt could reverse a
+/// fresh [pickup_X, delivery_X] pair into [delivery_X, pickup_X] and have
+/// the validator wave it through because an older committed pickup_X earlier
+/// in the route already "set the flag" — leading to a phantom delivery at
+/// runtime.
 bool GraspSolver::is_route_valid(const std::vector<RouteNode>& route) const {
-	std::set<int> picked_up;
+	std::map<int, int> cargo;
 	for (const RouteNode& node : route) {
 		if (node.customer_id < 0) continue;
 		if (node.type == RouteNodeType::BAKERY_PICKUP) {
-			picked_up.insert(node.customer_id);
+			cargo[node.customer_id] += node.bread_amount;
 		} else if (node.type == RouteNodeType::CUSTOMER_DELIVERY) {
-			if (!picked_up.count(node.customer_id)) return false;
+			cargo[node.customer_id] -= node.bread_amount;
+			if (cargo[node.customer_id] < 0) return false;
 		}
 	}
 	return true;

@@ -1,5 +1,6 @@
 #include "simulation.h"
 #include <algorithm>
+#include <cassert>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -65,12 +66,19 @@ void resolve_bakery_contention(
 			});
 
 		int available = bakeries[bakery_id].current_inventory;
+		assert(available >= 0);
+		assert(available <= bakeries[bakery_id].capacity);
+
 		for (Intent* intent : list) {
 			const int give = std::min(intent->requested_bread_amount, available);
+			assert(give >= 0);
+			assert(give <= available);
+			assert(give <= bakeries[bakery_id].capacity);     // Giant-Drone guard
 			allocation[intent->customer_id] = give;
 			if (give > 0) {
 				available -= give;
 				bakeries[bakery_id].current_inventory -= give;
+				assert(bakeries[bakery_id].current_inventory >= 0);
 				Intent r = *intent;
 				r.requested_bread_amount = give;
 				resolved.push_back(r);
@@ -106,6 +114,11 @@ std::vector<RouteNode> apply_allocation_to_route(
 			continue;
 		}
 		if (it->second <= 0) continue;  // dropped — skip pickup AND delivery
+
+		// Allocation may shrink a node (truncated by contention), never grow
+		// it — a larger amount would invent bread the contention resolver
+		// never approved.
+		assert(it->second <= node.bread_amount);
 
 		RouteNode adjusted = node;
 		adjusted.bread_amount = it->second;
@@ -163,6 +176,26 @@ void Simulation::validate_config() const {
 			"positive-amount outcome at positive probability — the simulation "
 			"would never finish.");
 	}
+
+	// "Giant-Drone" deadlock prevention. A drone whose max payload exceeds
+	// *every* bakery's silo ceiling could be assigned an order it can never
+	// fill in one stop, and naive code that waits for the full pickup would
+	// deadlock. Runtime clamps in build_candidates() defuse this when it
+	// happens — but defensive programming says: refuse the config that
+	// makes it possible, so the failure mode is impossible by construction.
+	int max_bakery_capacity = 0;
+	for (const BakeryConfig& bc : config.bakery_configs) {
+		if (bc.capacity > max_bakery_capacity) max_bakery_capacity = bc.capacity;
+	}
+	if (config.drone_template.capacity_max > max_bakery_capacity) {
+		throw std::runtime_error(
+			"Invalid config: drone_template.capacity_max ("
+			+ std::to_string(config.drone_template.capacity_max)
+			+ ") exceeds the largest bakery capacity ("
+			+ std::to_string(max_bakery_capacity)
+			+ "). A spawned drone could be assigned an order no single bakery "
+			"can fill — risks the \"Giant-Drone\" deadlock.");
+	}
 }
 
 
@@ -193,15 +226,27 @@ Drone Simulation::spawn_drone() {
 bool Simulation::should_spawn_drone() const {
 	double D_demand = 0.0;
 	for (const Customer& c : get_all_customers()) {
+		assert(c.order_quantity >= 0);
 		if (assigned_customer_ids.count(c.id)) continue;
 		D_demand += c.order_quantity;
 	}
 
 	double B_supply = 0.0;
-	for (const Bakery& b : bakeries) B_supply += b.current_inventory;
+	for (const Bakery& b : bakeries) {
+		assert(b.current_inventory >= 0);
+		assert(b.current_inventory <= b.capacity);
+		B_supply += b.current_inventory;
+	}
 
 	double C_fleet = 0.0;
-	for (const Drone& d : drones) C_fleet += d.max_capacity;
+	for (const Drone& d : drones) {
+		assert(d.max_capacity > 0);
+		C_fleet += d.max_capacity;
+	}
+
+	assert(D_demand >= 0.0);
+	assert(B_supply >= 0.0);
+	assert(C_fleet >= 0.0);
 
 	return (B_supply > 0.0) && (C_fleet < D_demand);
 }
@@ -325,12 +370,27 @@ void Simulation::advance_drone(Drone& drone) {
 
 	drone.current_pos = target.pos;
 	if (target.type == RouteNodeType::BAKERY_PICKUP) {
+		// A pickup must never push the drone past its max payload.
+		assert(target.bread_amount >= 0);
+		assert(drone.current_load + target.bread_amount <= drone.max_capacity);
 		target.committed   = true;
 		drone.current_load += target.bread_amount;
 	} else if (target.type == RouteNodeType::CUSTOMER_DELIVERY) {
+		// A delivery must never undershoot zero — drone has the cargo.
+		assert(target.bread_amount >= 0);
+		assert(drone.current_load >= target.bread_amount);
+		// Mark the delivery committed so that (a) apply_allocation_to_route
+		// doesn't rewrite an already-executed delivery's bread_amount when
+		// the customer is re-queued for partial fulfilment, and (b) 2-Opt's
+		// first_mutable correctly excludes it from the reorderable suffix.
+		// Without this flag, stale delivery nodes can be shuffled into the
+		// live route and trigger phantom deliveries with empty cargo.
+		target.committed   = true;
 		drone.current_load -= target.bread_amount;
 		drone.pending_deliveries.push_back({target.entity_id, target.bread_amount});
 	}
+	assert(drone.current_load >= 0);
+	assert(drone.current_load <= drone.max_capacity);
 	drone.route_progress++;
 }
 
@@ -342,6 +402,10 @@ void Simulation::apply_delivery_events() {
 	std::map<int, int> delivered;
 	for (Drone& d : drones) {
 		for (const DeliveryEvent& ev : d.pending_deliveries) {
+			// A delivery event is only enqueued from a committed delivery
+			// node whose bread_amount we already asserted >= 0; this guards
+			// against future code paths inventing negative deliveries.
+			assert(ev.bread_delivered >= 0);
 			delivered[ev.customer_id] += ev.bread_delivered;
 			total_bread_delivered     += ev.bread_delivered;
 			assigned_customer_ids.erase(ev.customer_id);
@@ -349,6 +413,7 @@ void Simulation::apply_delivery_events() {
 		}
 		d.pending_deliveries.clear();
 	}
+	assert(total_bread_delivered >= 0);
 	if (delivered.empty()) return;
 
 	std::vector<Customer> kept;
