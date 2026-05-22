@@ -302,6 +302,15 @@ bool GraspSolver::is_route_valid(const std::vector<RouteNode>& route) const {
  * Each candidate reversal must (a) preserve cargo balance and (b) strictly
  * improve total distance by more than kTwoOptEpsilon.
  *
+ * Optimisation: the distance delta of reversing route[i..j] is computed in
+ * O(1) directly from the four boundary edges, with no vector allocation, no
+ * deep copy, and no recomputation of the unchanged interior. The interior
+ * edges of a reversed segment have the SAME total length as before because
+ * hybrid_distance is symmetric (see distance.cpp::fill_symmetric_matrix), so
+ * they cancel out in the delta. Only when the delta proves the new route is
+ * shorter do we allocate a candidate, perform the reverse(), and pay for
+ * is_route_valid — collapsing the hot path from O(N) per (i,j) probe to O(1).
+ *
  * PRECONDITION: @p route is cargo-balance-valid on entry.
  */
 void GraspSolver::apply_two_opt(std::vector<RouteNode>& route,
@@ -319,19 +328,50 @@ void GraspSolver::apply_two_opt(std::vector<RouteNode>& route,
 	bool improved = true;
 	while (improved) {
 		improved = false;
-		double best = path_distance(start_pos, start_node, route, 0);
 
 		for (std::size_t i = first_mutable; i + 1 < route.size(); ++i) {
 			for (std::size_t j = i + 1; j < route.size(); ++j) {
+				// All four boundary positions/nodes are re-read each
+				// iteration: an earlier accepted swap inside this pass
+				// may have mutated route[i..k] for any k <= j-1, and
+				// route[i] in particular changes after every accept.
+				const Position& prev_pos  = (i == 0) ? start_pos : route[i - 1].pos;
+				const int       prev_node = (i == 0) ? start_node : node_id_for(route[i - 1]);
+				const Position& pi_pos    = route[i].pos;
+				const int       pi_node   = node_id_for(route[i]);
+				const Position& pj_pos    = route[j].pos;
+				const int       pj_node   = node_id_for(route[j]);
+
+				// Edges that change under a route[i..j] reversal:
+				//   into-i edge:   (prev -> route[i])   becomes (prev -> route[j])
+				//   out-of-j edge: (route[j] -> next)   becomes (route[i] -> next)
+				// Every other edge in the path is unchanged in either
+				// length (symmetric distance) or endpoints. The out-of-j
+				// edge only exists when j is not the last node.
+				double d_old = distance_between(prev_pos, prev_node, pi_pos, pi_node);
+				double d_new = distance_between(prev_pos, prev_node, pj_pos, pj_node);
+
+				if (j + 1 < route.size()) {
+					const Position& next_pos  = route[j + 1].pos;
+					const int       next_node = node_id_for(route[j + 1]);
+					d_old += distance_between(pj_pos, pj_node, next_pos, next_node);
+					d_new += distance_between(pi_pos, pi_node, next_pos, next_node);
+				}
+
+				const double delta = d_new - d_old;
+				if (delta >= -kTwoOptEpsilon) continue;  // not a strict improvement
+
+				// Math says this reversal saves distance. Only NOW do we
+				// pay the O(N) costs: copy, reverse, validate cargo-balance.
 				std::vector<RouteNode> candidate = route;
 				std::reverse(candidate.begin() + i, candidate.begin() + j + 1);
 				if (!is_route_valid(candidate)) continue;
-				const double d = path_distance(start_pos, start_node, candidate, 0);
-				if (d < best - kTwoOptEpsilon) {
-					route = std::move(candidate);
-					best = d;
-					improved = true;
-				}
+
+				route    = std::move(candidate);
+				improved = true;
+				// Continue scanning within the same pass — matches the
+				// original "many accepts per pass" descent. Subsequent
+				// iterations refetch route[*] above and see the new state.
 			}
 		}
 	}
