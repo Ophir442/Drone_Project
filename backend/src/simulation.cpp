@@ -17,8 +17,8 @@
 #include <cmath>
 #include <iostream>
 #include <limits>
-#include <map>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace {
 
@@ -28,12 +28,40 @@ constexpr double kPriorityCeiling   = 1e12;  ///< Cap on priority_weight to prev
 /**
  * @brief Build a fully-seeded Mersenne Twister.
  *
- * std::random_device provides non-deterministic entropy (on Linux:
- * /dev/urandom); feeding it through std::seed_seq with eight draws fills
- * mt19937's 19937-bit state properly instead of relying on the warm-up
- * pattern that a single 32-bit seed produces. Called only from the main thread.
+ * Both branches feed std::seed_seq exactly 256 bits of input so mt19937's
+ * 19937-bit state expansion has wide entropy regardless of seed source:
+ *   - Non-deterministic: 8 × 32-bit draws from std::random_device (/dev/urandom).
+ *   - Deterministic:     8 × 32-bit words derived from @c cfg.seed via four
+ *                        SplitMix64 iterations. A naive {seed_low, seed_high}
+ *                        feed underseeds mt19937 (Vigna 2014) — early state
+ *                        words become highly correlated for nearby seeds.
+ *
+ * Called only from the main thread.
  */
-std::mt19937 make_random_engine() {
+std::mt19937 make_random_engine(const SimConfig& cfg) {
+	if (cfg.deterministic) {
+		// SplitMix64: deterministic but avalanche-strong, the canonical way
+		// to expand a single 64-bit seed into a wide initial state.
+		auto splitmix = [](std::uint64_t& x) {
+			x += 0x9E3779B97F4A7C15ULL;
+			std::uint64_t z = x;
+			z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+			z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+			return z ^ (z >> 31);
+		};
+		std::uint64_t s = cfg.seed;
+		const std::uint64_t a = splitmix(s);
+		const std::uint64_t b = splitmix(s);
+		const std::uint64_t c = splitmix(s);
+		const std::uint64_t d = splitmix(s);
+		std::seed_seq seq{
+			static_cast<std::uint32_t>(a),        static_cast<std::uint32_t>(a >> 32),
+			static_cast<std::uint32_t>(b),        static_cast<std::uint32_t>(b >> 32),
+			static_cast<std::uint32_t>(c),        static_cast<std::uint32_t>(c >> 32),
+			static_cast<std::uint32_t>(d),        static_cast<std::uint32_t>(d >> 32),
+		};
+		return std::mt19937(seq);
+	}
 	std::random_device rd;
 	std::seed_seq seq{rd(), rd(), rd(), rd(), rd(), rd(), rd(), rd()};
 	return std::mt19937(seq);
@@ -87,11 +115,15 @@ void resolve_bakery_contention(
 	std::vector<Intent>& intents,
 	std::vector<Bakery>& bakeries,
 	std::vector<Intent>& resolved,
-	std::map<int, int>&  allocation)
+	std::unordered_map<int, int>& allocation)
 {
-	std::map<int, std::vector<Intent*>> per_bakery;
+	std::unordered_map<int, std::vector<Intent*>> per_bakery;
+	per_bakery.reserve(bakeries.size());
 	for (auto& it : intents) per_bakery[it.bakery_id].push_back(&it);
 
+	// Per-bakery iteration order is now unspecified, but each per-bakery
+	// group is independently sorted by original_score below — bakery
+	// iteration order does not affect the resolution outcome.
 	for (auto& [bakery_id, list] : per_bakery) {
 		std::sort(list.begin(), list.end(),
 			[](const Intent* a, const Intent* b) {
@@ -133,7 +165,7 @@ void resolve_bakery_contention(
  */
 std::vector<RouteNode> apply_allocation_to_route(
 	const std::vector<RouteNode>& route,
-	const std::map<int, int>& allocation)
+	const std::unordered_map<int, int>& allocation)
 {
 	std::vector<RouteNode> out;
 	out.reserve(route.size());
@@ -171,9 +203,15 @@ std::vector<RouteNode> apply_allocation_to_route(
 
 
 Simulation::Simulation(const SimConfig& config)
-	: config(config), rng(make_random_engine()),
+	: config(config), rng(make_random_engine(config)),
 	  next_customer_id(0), next_drone_id(0),
-	  current_round(0), total_bread_delivered(0), total_customers_served(0) {}
+	  current_round(0), total_bread_delivered(0), total_customers_served(0)
+{
+	// Single source of truth: validation happens at construction, so every
+	// execution path (run(), HTTP server, /api/reset) is guaranteed to operate
+	// on a config that won't NaN-propagate or divide by zero in the workers.
+	validate_config();
+}
 
 
 /* ---------- validation ---------- */
@@ -365,7 +403,7 @@ Drone Simulation::spawn_drone() {
  */
 bool Simulation::should_spawn_drone() const {
 	double D_demand = 0.0;
-	for (const Customer& c : get_all_customers()) {
+	for (const Customer& c : customer_queue) {
 		assert(c.order_quantity >= 0);
 		if (assigned_customer_ids.count(c.id)) continue;
 		D_demand += c.order_quantity;
@@ -411,19 +449,27 @@ void Simulation::initialize() {
 		                    bc.production_distribution});
 	}
 
+	// INVARIANT: bakeries are stored with id == vector index. resolve_bakery_contention,
+	// apply_allocation_to_route, and find_best_bakery all depend on this for O(1)
+	// indexing. Future refactors that re-number bakeries MUST re-establish this.
+	for (std::size_t i = 0; i < bakeries.size(); ++i) {
+		assert(bakeries[i].id == static_cast<int>(i));
+	}
+
 	delivery_graph.initialize(bakeries, config.base_pos);
 
 	for (int i = 0; i < config.drone_template.initial_count; ++i) {
 		drones.push_back(spawn_drone());
 	}
 
+	customer_queue.reserve(config.customer_configs.size());
 	for (const auto& cc : config.customer_configs) {
 		Customer c;
 		c.id              = next_customer_id++;
 		c.pos             = cc.pos;
 		c.order_quantity  = cc.order_quantity;
 		c.priority_weight = 1.0;
-		customer_queue.push(c);
+		customer_queue.push_back(c);
 	}
 
 	thread_pool = std::make_unique<ThreadPool>(config.thread_count);
@@ -432,7 +478,7 @@ void Simulation::initialize() {
 void Simulation::reset() {
 	bakeries.clear();
 	drones.clear();
-	while (!customer_queue.empty()) customer_queue.pop();
+	customer_queue.clear();
 	last_resolved_intents.clear();
 	assigned_customer_ids.clear();
 	served_this_round.clear();
@@ -441,7 +487,7 @@ void Simulation::reset() {
 	next_drone_id          = 0;
 	total_bread_delivered  = 0;
 	total_customers_served = 0;
-	rng = make_random_engine();
+	rng = make_random_engine(config);
 	initialize();
 }
 
@@ -453,27 +499,14 @@ void Simulation::add_customer(double x, double y, int order_quantity,
 	c.pos             = {x, y};
 	c.order_quantity  = order_quantity;
 	c.priority_weight = 1.0;
-	customer_queue.push(c);
+	customer_queue.push_back(c);
 }
 
 void Simulation::remove_customer(int customer_id) {
-	std::vector<Customer> kept;
-	while (!customer_queue.empty()) {
-		Customer c = customer_queue.top();
-		customer_queue.pop();
-		if (c.id != customer_id) kept.push_back(c);
-	}
-	for (const Customer& c : kept) customer_queue.push(c);
-}
-
-std::vector<Customer> Simulation::get_all_customers() const {
-	std::vector<Customer> out;
-	auto copy = customer_queue;
-	while (!copy.empty()) {
-		out.push_back(copy.top());
-		copy.pop();
-	}
-	return out;
+	customer_queue.erase(
+		std::remove_if(customer_queue.begin(), customer_queue.end(),
+			[customer_id](const Customer& c) { return c.id == customer_id; }),
+		customer_queue.end());
 }
 
 
@@ -485,7 +518,7 @@ std::vector<Customer> Simulation::get_all_customers() const {
  * If the drone is within one step of the target, it arrives and either
  * commits a pickup (cargo += amount) or queues a delivery event (cargo -=
  * amount). Delivery events are drained on the main thread by
- * apply_delivery_events so the customer priority_queue stays single-writer.
+ * apply_delivery_events so the customer vector stays single-writer.
  *
  * Marking the just-executed node as @c committed protects it from later
  * mutation (allocation rewriting, 2-Opt reordering).
@@ -536,15 +569,20 @@ void Simulation::advance_drone(Drone& drone) {
 }
 
 /**
- * @brief Drain queued delivery events into the customer priority queue.
+ * @brief Drain queued delivery events into the customer vector.
  *
- * Single-threaded: std::priority_queue is not thread-safe and the workers
- * accumulate DeliveryEvents into per-drone buffers during stage 1.
+ * Single-threaded: workers accumulate DeliveryEvents into per-drone buffers
+ * during stage 1; this drain runs on the main thread after the futures join,
+ * so the customer vector stays single-writer.
+ *
+ * Bookkeeping is in-place — no drain-and-rebuild of the container. Customers
+ * whose order_quantity hits zero are erased via remove_if.
  */
 void Simulation::apply_delivery_events() {
 	served_this_round.clear();
 
-	std::map<int, int> delivered;
+	std::unordered_map<int, int> delivered;
+	delivered.reserve(drones.size());
 	for (Drone& d : drones) {
 		for (const DeliveryEvent& ev : d.pending_deliveries) {
 			assert(ev.bread_delivered >= 0);
@@ -558,21 +596,17 @@ void Simulation::apply_delivery_events() {
 	assert(total_bread_delivered >= 0);
 	if (delivered.empty()) return;
 
-	std::vector<Customer> kept;
-	while (!customer_queue.empty()) {
-		Customer c = customer_queue.top();
-		customer_queue.pop();
+	// In-place debit, then erase fully-served customers in a single sweep.
+	for (Customer& c : customer_queue) {
 		const auto it = delivered.find(c.id);
-		if (it != delivered.end()) {
-			c.order_quantity -= it->second;
-			if (c.order_quantity <= 0) {
-				total_customers_served++;
-				continue;
-			}
-		}
-		kept.push_back(c);
+		if (it != delivered.end()) c.order_quantity -= it->second;
 	}
-	for (const Customer& c : kept) customer_queue.push(c);
+	const std::size_t before = customer_queue.size();
+	customer_queue.erase(
+		std::remove_if(customer_queue.begin(), customer_queue.end(),
+			[](const Customer& c) { return c.order_quantity <= 0; }),
+		customer_queue.end());
+	total_customers_served += static_cast<int>(before - customer_queue.size());
 }
 
 
@@ -585,7 +619,7 @@ void Simulation::apply_delivery_events() {
  * drone motion (one velocity-step along each planned route) run concurrently
  * on the thread pool. Post-step bookkeeping — delivery event drain and
  * priority increment for unserved customers — runs on the main thread to
- * keep the priority_queue single-writer.
+ * keep the customer vector single-writer.
  *
  * Each bakery worker gets its own RNG seeded off the main RNG; the master
  * std::mt19937 must not be shared across worker threads.
@@ -625,14 +659,12 @@ void Simulation::stage1_state_update() {
 	// Priority bookkeeping: customers not served this round get
 	// +priority_increment, capped at kPriorityCeiling to prevent unbounded
 	// growth (which could eventually produce NaN-tainted GRASP scores).
-	std::vector<Customer> customers = get_all_customers();
-	while (!customer_queue.empty()) customer_queue.pop();
-	for (Customer c : customers) {
-		if (!served_this_round.count(c.id)) {
-			c.priority_weight += config.priority_increment;
-			if (c.priority_weight > kPriorityCeiling) c.priority_weight = kPriorityCeiling;
-		}
-		customer_queue.push(c);
+	// All unserved customers receive the SAME delta, so relative order is
+	// preserved — no re-heapify or re-sort is needed here.
+	for (Customer& c : customer_queue) {
+		if (served_this_round.count(c.id)) continue;
+		c.priority_weight += config.priority_increment;
+		if (c.priority_weight > kPriorityCeiling) c.priority_weight = kPriorityCeiling;
 	}
 }
 
@@ -643,13 +675,23 @@ void Simulation::stage1_state_update() {
  * shared state when computing route times. The configured iteration budget
  * is split as evenly as possible across worker threads; each thread keeps
  * only its best-scoring solution, and the main thread reduces across them.
+ *
+ * GRASP needs customers in priority order (high priority first), so we sort
+ * a one-shot snapshot here. The underlying customer_queue stays unsorted —
+ * its only invariant is "contains all active customers."
  */
 GraspSolution Simulation::stage2_3_assignment() {
 	std::vector<Customer> customers;
-	for (const Customer& c : get_all_customers()) {
+	customers.reserve(customer_queue.size());
+	for (const Customer& c : customer_queue) {
 		if (!assigned_customer_ids.count(c.id)) customers.push_back(c);
 	}
 	if (customers.empty()) return {};
+
+	// Customer::operator< is max-heap order (a < b iff a.priority < b.priority).
+	// Sort descending = "b < a" comparator.
+	std::sort(customers.begin(), customers.end(),
+		[](const Customer& a, const Customer& b) { return b < a; });
 
 	std::vector<Bakery> bakeries_snap = bakeries;
 	std::vector<Drone>  drones_snap   = drones;
@@ -679,13 +721,14 @@ GraspSolution Simulation::stage2_3_assignment() {
 		futures.push_back(thread_pool->submit(
 			[this, &customers, &bakeries_snap, &drones_snap,
 			 &dist_cache, &thread_rngs, t, my_iters] {
-				GraspSolver solver(delivery_graph, config.rcl_size, config.grasp_iterations);
+				GraspSolver solver(delivery_graph, config.rcl_size,
+				                   config.grasp_iterations, dist_cache);
 				ThreadResult best;
 				for (int i = 0; i < my_iters; ++i) {
 					GraspSolution sol = solver.run_single_iteration(
 						customers, drones_snap, bakeries_snap,
-						config.base_pos, dist_cache, thread_rngs[t]);
-					const double s = GraspSolver::evaluate_solution(sol.intents);
+						config.base_pos, thread_rngs[t]);
+					const double s = sol.final_score;
 					if (s > best.score) {
 						best.score    = s;
 						best.solution = std::move(sol);
@@ -721,8 +764,9 @@ GraspSolution Simulation::stage2_3_assignment() {
  *      production isn't wasted on a full silo.
  */
 void Simulation::stage4_commit(GraspSolution& solution) {
-	std::vector<Intent> resolved;
-	std::map<int, int>  allocation;
+	std::vector<Intent>          resolved;
+	std::unordered_map<int, int> allocation;
+	allocation.reserve(solution.intents.size());
 	resolve_bakery_contention(solution.intents, bakeries, resolved, allocation);
 
 	for (auto& [drone_id, route] : solution.drone_routes) {
@@ -733,7 +777,8 @@ void Simulation::stage4_commit(GraspSolution& solution) {
 		             d->route_progress >= static_cast<int>(d->planned_route.size());
 	}
 
-	std::set<int> assigned_drone_ids;
+	std::unordered_set<int> assigned_drone_ids;
+	assigned_drone_ids.reserve(resolved.size());
 	for (const Intent& it : resolved) {
 		assigned_customer_ids.insert(it.customer_id);
 		assigned_drone_ids.insert(it.drone_id);
@@ -766,7 +811,7 @@ const Bakery* Simulation::choose_repositioning_target(const Drone& drone) const 
 
 /// Send each truly-idle drone toward its highest-gravity bakery so that
 /// stochastic production isn't wasted on a full silo.
-void Simulation::reposition_idle_drones(const std::set<int>& assigned_drone_ids) {
+void Simulation::reposition_idle_drones(const std::unordered_set<int>& assigned_drone_ids) {
 	if (bakeries.empty()) return;
 
 	for (Drone& d : drones) {
@@ -839,8 +884,6 @@ bool Simulation::step_round() {
 }
 
 void Simulation::run() {
-	validate_config();
 	initialize();
-
 	while (step_round()) {}
 }

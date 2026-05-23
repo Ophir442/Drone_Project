@@ -26,9 +26,11 @@ namespace {
 /// Set by the signal handler; polled by main() to trigger graceful shutdown.
 std::atomic<bool> g_shutdown_requested{false};
 
-/// Async-signal-safe: writes one atomic. No iostream, no joins, no exit().
+/// Async-signal-safe: writes one atomic with release semantics so that any
+/// future teardown bookkeeping the main thread does after observing the flag
+/// is correctly synchronized-with the signal-handler context.
 extern "C" void signal_handler(int /*sig*/) {
-	g_shutdown_requested.store(true, std::memory_order_relaxed);
+	g_shutdown_requested.store(true, std::memory_order_release);
 }
 
 /// Parse config.json into a fully-populated SimConfig. Throws on parse
@@ -53,6 +55,8 @@ SimConfig load_config(const std::string& path) {
 
 	const auto& sim = j.at("simulation");
 	config.priority_increment = sim.value("priority_increment", 1.0);
+	config.deterministic      = sim.value("deterministic", false);
+	config.seed               = sim.value("seed", static_cast<std::uint64_t>(0));
 
 	const auto& algo = j.at("algorithm");
 	config.grasp_iterations = algo.value("grasp_iterations", 5);
@@ -133,7 +137,7 @@ int main(int argc, char* argv[]) {
 
 		server.start();
 
-		while (!g_shutdown_requested.load(std::memory_order_relaxed)) {
+		while (!g_shutdown_requested.load(std::memory_order_acquire)) {
 			std::this_thread::sleep_for(std::chrono::milliseconds(200));
 		}
 

@@ -19,8 +19,9 @@
  * synchronizes-with the NEXT producer's acquire-load on the same slot, so the
  * next producer is guaranteed to see the previous task's destructor side
  * effects before overwriting the slot. This also prevents memory leaks: the
- * shared_ptr<packaged_task> captured inside the std::function is destroyed
- * exactly once when the slot is overwritten or when the queue is destroyed.
+ * unique_ptr<TaskBase> in each slot owns its TaskImpl (which in turn owns
+ * the captured shared_ptr<packaged_task>) and is destroyed exactly once
+ * when the slot is overwritten or when the queue is destroyed.
  *
  * The producer/consumer cursors themselves can be memory_order_relaxed: the
  * CAS just decides "who got this slot first." Cross-thread visibility of the
@@ -38,6 +39,18 @@
 #include "thread_pool.h"
 
 #include <cassert>
+
+// SMT-aware spin hint. On x86 _mm_pause yields the pipeline to the sibling
+// logical core and shortens back-off latency; ARM has an analogous YIELD.
+// Used inside the bounded spin band *before* falling back to std::this_thread::yield().
+#if defined(__x86_64__) || defined(__i386__)
+  #include <emmintrin.h>
+  static inline void cpu_relax() { _mm_pause(); }
+#elif defined(__aarch64__)
+  static inline void cpu_relax() { asm volatile("yield" ::: "memory"); }
+#else
+  static inline void cpu_relax() {}
+#endif
 
 namespace {
 
@@ -77,12 +90,12 @@ ThreadPool::~ThreadPool() {
 	// Release-store so any task ENQUEUED before this point happens-before
 	// the corresponding worker's acquire-load of stop_, even if that worker
 	// only observes stop_ after a few extra spin iterations.
-	stop_.store(true, std::memory_order_release);
+	stop_.value.store(true, std::memory_order_release);
 	for (auto& w : workers_) w.join();
 }
 
 void ThreadPool::enqueue(Job&& job) {
-	std::size_t pos   = enqueue_pos_.load(std::memory_order_relaxed);
+	std::size_t pos   = enqueue_pos_.value.load(std::memory_order_relaxed);
 	std::size_t spins = 0;
 
 	for (;;) {
@@ -92,40 +105,42 @@ void ThreadPool::enqueue(Job&& job) {
 
 		if (diff == 0) {
 			// Slot is free at our logical position — try to claim it.
-			if (enqueue_pos_.compare_exchange_weak(
+			if (enqueue_pos_.value.compare_exchange_weak(
 			        pos, pos + 1,
 			        std::memory_order_relaxed,
 			        std::memory_order_relaxed))
 			{
-				// We own slot[pos]. Write the task, then publish via the
-				// release-store on sequence. The consumer that later sees
-				// sequence == pos + 1 via acquire-load is guaranteed to
-				// see this write.
+				// We own slot[pos]. Move the unique_ptr<TaskBase> in, then
+				// publish via the release-store on sequence. The consumer that
+				// later sees sequence == pos + 1 via acquire-load is guaranteed
+				// to see this write.
 				slot.task = std::move(job);
 				slot.sequence.store(pos + 1, std::memory_order_release);
 				return;
 			}
 			// CAS failed: another producer beat us; pos was updated.
 		} else if (diff < 0) {
-			// Queue full: a consumer hasn't drained slot[pos] yet. Spin a
-			// bounded number of iterations to absorb short stalls, then
-			// yield the scheduler. yield() is NOT an OS blocking primitive
-			// — it's a scheduling hint that lets ready peers run.
+			// Queue full: a consumer hasn't drained slot[pos] yet. Bounded
+			// PAUSE-spin to relax the SMT pipeline, then yield the scheduler.
+			// PAUSE prevents the spin from starving the sibling logical core
+			// and reduces wakeup latency; yield() lets ready peers run.
 			if (++spins >= kSpinsBeforeYield) {
 				std::this_thread::yield();
 				spins = 0;
+			} else {
+				cpu_relax();
 			}
-			pos = enqueue_pos_.load(std::memory_order_relaxed);
+			pos = enqueue_pos_.value.load(std::memory_order_relaxed);
 		} else {
 			// Another producer has already moved enqueue_pos_ past us
 			// (seq > pos means slot[pos] is the consumer's job now). Reread.
-			pos = enqueue_pos_.load(std::memory_order_relaxed);
+			pos = enqueue_pos_.value.load(std::memory_order_relaxed);
 		}
 	}
 }
 
 bool ThreadPool::try_dequeue(Job& out) {
-	std::size_t pos = dequeue_pos_.load(std::memory_order_relaxed);
+	std::size_t pos = dequeue_pos_.value.load(std::memory_order_relaxed);
 
 	for (;;) {
 		Slot& slot      = slots_[pos & kQueueMask];
@@ -134,20 +149,20 @@ bool ThreadPool::try_dequeue(Job& out) {
 
 		if (diff == 0) {
 			// Slot is filled and ours to take — try to claim it.
-			if (dequeue_pos_.compare_exchange_weak(
+			if (dequeue_pos_.value.compare_exchange_weak(
 			        pos, pos + 1,
 			        std::memory_order_relaxed,
 			        std::memory_order_relaxed))
 			{
 				// Acquire above synchronizes-with the producer's release
 				// on the same slot, so this move sees the producer's
-				// fully-constructed std::function.
+				// fully-constructed unique_ptr<TaskBase>.
 				out = std::move(slot.task);
-				// Eagerly drop the captured shared_ptr<packaged_task> by
-				// resetting the slot. Belt-and-suspenders: std::function's
-				// move leaves the source empty in libstdc++/libc++, but
-				// the standard says only "valid but unspecified."
-				slot.task = nullptr;
+				// Eagerly drop the moved-from pointer. unique_ptr's move
+				// already leaves the source null on libstdc++/libc++ — this
+				// is belt-and-suspenders against future allocator-aware
+				// move semantics.
+				slot.task.reset();
 				// Release-store advances sequence by kQueueCapacity so the
 				// NEXT producer at logical position (pos + kQueueCapacity)
 				// can claim the same physical slot, and so sees the destruction
@@ -161,7 +176,7 @@ bool ThreadPool::try_dequeue(Job& out) {
 			return false;
 		} else {
 			// Another consumer already moved dequeue_pos_ past us. Reread.
-			pos = dequeue_pos_.load(std::memory_order_relaxed);
+			pos = dequeue_pos_.value.load(std::memory_order_relaxed);
 		}
 	}
 }
@@ -172,7 +187,7 @@ void ThreadPool::worker_loop() {
 	for (;;) {
 		Job job;
 		if (try_dequeue(job)) {
-			job();
+			job->run();
 			spins = 0;
 			continue;
 		}
@@ -180,24 +195,26 @@ void ThreadPool::worker_loop() {
 		// Empty probe — check for shutdown.
 		// Acquire pairs with the destructor's release-store so any task
 		// enqueued before ~ThreadPool() began is guaranteed visible here.
-		if (stop_.load(std::memory_order_acquire)) {
+		if (stop_.value.load(std::memory_order_acquire)) {
 			// Drain race-window: a producer may have published a task
 			// after our first try_dequeue but before we sampled stop_.
 			// A second probe closes that hole.
 			if (try_dequeue(job)) {
-				job();
+				job->run();
 				continue;
 			}
 			return;
 		}
 
-		// No task, not stopping — spin briefly, then yield. The bounded
-		// spin keeps us responsive when a task arrives in microseconds;
-		// the yield prevents complete starvation of co-located threads
-		// when the queue stays empty for longer.
+		// No task, not stopping — relax-spin briefly, then yield. PAUSE
+		// keeps us responsive to a task arriving in microseconds without
+		// starving the SMT sibling; yield() prevents complete starvation
+		// of co-located threads when the queue stays empty for longer.
 		if (++spins >= kSpinsBeforeYield) {
 			std::this_thread::yield();
 			spins = 0;
+		} else {
+			cpu_relax();
 		}
 	}
 }

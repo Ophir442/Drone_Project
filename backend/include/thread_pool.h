@@ -18,9 +18,12 @@
  *
  * Synchronization model: a Vyukov-style bounded MPMC ring buffer with
  * per-slot sequence numbers and CAS — no std::mutex, no condition_variable,
- * no OS-level blocking primitives on the hot path. Workers spin and yield()
- * the scheduler when the queue is empty; producers spin and yield() when the
- * queue is full.
+ * no OS-level blocking primitives on the hot path. Workers spin (PAUSE) and
+ * yield() the scheduler when the queue is empty; producers spin and yield()
+ * when the queue is full.
+ *
+ * Tasks are typed-erased through a tiny TaskBase virtual dispatch instead of
+ * std::function — one indirection per call, one allocation per submit.
  *
  * Callers obtain completion status via the std::future returned by submit().
  * The pool joins all workers on destruction.
@@ -63,7 +66,29 @@ private:
 	/// folly/ConcurrentQueue benchmarks for typical workloads.
 	static constexpr std::size_t kSpinsBeforeYield  = 32;
 
-	using Job = std::function<void()>;
+	static constexpr std::size_t kCacheLine         = 64;
+
+	/// Type-erased task base — one virtual indirection per call, vs
+	/// std::function's two-layer type-erasure (function wrapper + captured
+	/// shared_ptr). The vtable call is devirtualizable under LTO.
+	///
+	/// run() is intentionally NOT noexcept: std::packaged_task::operator()
+	/// can throw std::future_error if the task is in an invalid state
+	/// (already-invoked, moved-from, empty). The user's own exception is
+	/// always captured into the future's shared state — but framework
+	/// exceptions must be allowed to propagate to the worker loop rather
+	/// than trip std::terminate.
+	struct TaskBase {
+		virtual void run() = 0;
+		virtual ~TaskBase() = default;
+	};
+	template<class F>
+	struct TaskImpl final : TaskBase {
+		F f;
+		explicit TaskImpl(F&& fn) : f(std::move(fn)) {}
+		void run() override { f(); }
+	};
+	using Job = std::unique_ptr<TaskBase>;
 
 	/**
 	 * @brief One ring-buffer slot.
@@ -76,9 +101,16 @@ private:
 	 * Padded to a 64-byte cache line to prevent false sharing between
 	 * adjacent slots that happen to be hammered by different cores.
 	 */
-	struct alignas(64) Slot {
+	struct alignas(kCacheLine) Slot {
 		std::atomic<std::size_t> sequence;
 		Job                      task;
+	};
+
+	/// Pad an atomic to fill a full cache line so producer and consumer
+	/// cursors never share a line with neighboring class members.
+	template<class T>
+	struct alignas(kCacheLine) CacheLinePadded {
+		T value;
 	};
 
 	void worker_loop();
@@ -87,25 +119,42 @@ private:
 
 	// Producer/consumer cursors live on their own cache lines so the two
 	// roles don't ping-pong the same line between cores.
-	alignas(64) std::atomic<std::size_t> enqueue_pos_{0};
-	alignas(64) std::atomic<std::size_t> dequeue_pos_{0};
-	alignas(64) std::atomic<bool>        stop_{false};
+	CacheLinePadded<std::atomic<std::size_t>> enqueue_pos_{};
+	CacheLinePadded<std::atomic<std::size_t>> dequeue_pos_{};
+	CacheLinePadded<std::atomic<bool>>        stop_{};
 
 	std::unique_ptr<Slot[]>  slots_;
 	std::vector<std::thread> workers_;
+
+	// ---- compile-time invariants ----
+	// Cache-line isolation must be enforced statically: a future refactor that
+	// fattens the atomic types or swaps the Slot::task type must not silently
+	// collapse the no-false-sharing guarantee.
+	static_assert(sizeof(CacheLinePadded<std::atomic<std::size_t>>) == kCacheLine,
+	              "CacheLinePadded<atomic<size_t>> must occupy exactly one cache line.");
+	static_assert(sizeof(CacheLinePadded<std::atomic<bool>>)        == kCacheLine,
+	              "CacheLinePadded<atomic<bool>> must occupy exactly one cache line.");
+	static_assert(alignof(Slot)            >= kCacheLine,
+	              "Slot must be cache-line aligned to prevent inter-slot false sharing.");
+	static_assert(sizeof(Slot) % kCacheLine == 0,
+	              "Slot size must be a multiple of one cache line.");
 };
 
 template<typename F, typename... Args>
 auto ThreadPool::submit(F&& f, Args&&... args) -> std::future<decltype(f(args...))> {
-	using return_type = decltype(f(args...));
+	using R = decltype(f(args...));
 
-	// Same shared_ptr<packaged_task> idiom as before: lets us erase the
-	// return type into a std::function<void()> while keeping the future alive.
-	auto task = std::make_shared<std::packaged_task<return_type()>>(
+	// shared_ptr lets us erase the packaged_task into a void()-returning
+	// lambda while keeping the future alive. We pay one heap allocation for
+	// the shared_ptr control block + packaged_task storage (via make_shared)
+	// and one for the TaskImpl wrapper. std::function would have added a
+	// third (the function wrapper itself) on top of that.
+	auto task_ptr = std::make_shared<std::packaged_task<R()>>(
 		std::bind(std::forward<F>(f), std::forward<Args>(args)...)
 	);
+	std::future<R> result = task_ptr->get_future();
 
-	std::future<return_type> result = task->get_future();
-	enqueue([task]() { (*task)(); });
+	auto wrapped = [task_ptr]() { (*task_ptr)(); };
+	enqueue(std::make_unique<TaskImpl<decltype(wrapped)>>(std::move(wrapped)));
 	return result;
 }

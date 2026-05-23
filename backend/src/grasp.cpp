@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <cassert>
 #include <limits>
+#include <unordered_map>
 
 namespace {
 
@@ -42,46 +43,36 @@ int future_load(const Drone& drone) {
 }  // namespace
 
 
-GraspSolver::GraspSolver(const DeliveryGraph& graph, int rcl_size, int iterations)
-	: graph(graph), rcl_size(rcl_size), iterations(iterations) {}
+GraspSolver::GraspSolver(const DeliveryGraph& graph, int rcl_size, int iterations,
+                         const DistanceCache& cache)
+	: graph(graph), rcl_size(rcl_size), iterations(iterations), cache(cache) {}
 
 
 /* ---------- distance helpers ---------- */
 
-/// Single dispatch point for "distance between two waypoints". Prefers the
-/// per-round cache (matrix lookup) and falls back to the static delivery
-/// graph (matrix or Euclidean) otherwise.
+/// Single dispatch point for "distance between two waypoints". DistanceCache::lookup
+/// already has an internal Euclidean fallback for unknown node ids, so we no
+/// longer need a cache==nullptr conditional here.
 double GraspSolver::distance_between(const Position& a, int a_node,
                                      const Position& b, int b_node) const {
-	return cache ? cache->lookup(a, a_node, b, b_node)
-	             : graph.hybrid_distance(a, a_node, b, b_node);
+	return cache.lookup(a, a_node, b, b_node);
 }
 
-/// Resolve the cache-or-graph node id of @p node. Customer nodes return -1
-/// when no per-round cache is active, so the caller will Euclidean-fallback.
 int GraspSolver::node_id_for(const RouteNode& node) const {
-	if (cache) {
-		switch (node.type) {
-			case RouteNodeType::BAKERY_PICKUP:     return cache->bakery_node(node.entity_id);
-			case RouteNodeType::BASE_RETURN:       return cache->base_node();
-			case RouteNodeType::CUSTOMER_DELIVERY: return cache->customer_node(node.entity_id);
-		}
-		return -1;
-	}
 	switch (node.type) {
-		case RouteNodeType::BAKERY_PICKUP:     return node.entity_id;
-		case RouteNodeType::BASE_RETURN:       return graph.get_base_node();
-		case RouteNodeType::CUSTOMER_DELIVERY: return -1;
+		case RouteNodeType::BAKERY_PICKUP:     return cache.bakery_node(node.entity_id);
+		case RouteNodeType::BASE_RETURN:       return cache.base_node();
+		case RouteNodeType::CUSTOMER_DELIVERY: return cache.customer_node(node.entity_id);
 	}
 	return -1;
 }
 
 int GraspSolver::drone_start_node(const Drone& drone) const {
-	return cache ? cache->drone_node(drone.id) : -1;
+	return cache.drone_node(drone.id);
 }
 
 int GraspSolver::base_node_id() const {
-	return cache ? cache->base_node() : graph.get_base_node();
+	return cache.base_node();
 }
 
 
@@ -126,22 +117,53 @@ double GraspSolver::compute_route_time(const Drone& drone,
 /// Estimated time-to-complete for the drone's plan if we *appended* a
 /// (pickup, delivery) pair for @p customer at @p bakery for @p amount bread.
 /// Used to compute the marginal route cost Δt for the GRASP score.
+///
+/// Zero allocations: instead of copying planned_route + 2 nodes into a
+/// hypothetical vector and resumming, we sum the existing tail directly and
+/// add three closed-form edges (last -> bakery -> customer -> base). Same
+/// answer; no per-candidate vector construction.
 double GraspSolver::compute_route_time_with_assignment(
 	const Drone& drone, const Bakery& bakery, const Customer& customer,
 	int amount, const Position& base_pos) const
 {
 	assert(drone.velocity > 0.0);
-	std::vector<RouteNode> hypothetical = drone.planned_route;
-	hypothetical.push_back(
-		{RouteNodeType::BAKERY_PICKUP, bakery.pos, bakery.id, customer.id, amount, false});
-	hypothetical.push_back(
-		{RouteNodeType::CUSTOMER_DELIVERY, customer.pos, customer.id, customer.id, amount, false});
+	(void)amount;   // distance-only; the amount affects cargo, not geometry
 
-	const double d = path_distance(
-		drone.current_pos, drone_start_node(drone),
-		hypothetical, drone.route_progress,
-		&base_pos, base_node_id());
-	return d / drone.velocity;
+	const int bakery_node_id   = cache.bakery_node(bakery.id);
+	const int customer_node_id = cache.customer_node(customer.id);
+	const int base_node        = base_node_id();
+
+	// Distance through the drone's existing tail (no return-to-base hop here;
+	// we own that hop ourselves below).
+	Position last_pos;
+	int      last_node;
+	double   existing = 0.0;
+
+	const bool has_tail =
+		!drone.planned_route.empty() &&
+		drone.route_progress < static_cast<int>(drone.planned_route.size());
+
+	if (!has_tail) {
+		last_pos  = drone.current_pos;
+		last_node = drone_start_node(drone);
+	} else {
+		existing = path_distance(
+			drone.current_pos, drone_start_node(drone),
+			drone.planned_route, drone.route_progress,
+			/*end_pos*/  nullptr,
+			/*end_node*/ -1);
+		const RouteNode& tail = drone.planned_route.back();
+		last_pos  = tail.pos;
+		last_node = node_id_for(tail);
+	}
+
+	// Appended segment: ... -> bakery -> customer -> base.
+	const double extra =
+		distance_between(last_pos,     last_node,        bakery.pos,   bakery_node_id) +
+		distance_between(bakery.pos,   bakery_node_id,   customer.pos, customer_node_id) +
+		distance_between(customer.pos, customer_node_id, base_pos,     base_node);
+
+	return (existing + extra) / drone.velocity;
 }
 
 
@@ -275,20 +297,53 @@ std::vector<GraspSolver::Candidate> GraspSolver::build_candidates(
  * a drone's route may contain multiple pickup/delivery pairs for the same
  * customer (e.g. after a partial-fulfilment re-assignment across rounds).
  *
- * Without the balance check, 2-Opt could reverse a fresh
- * [pickup_X, delivery_X] pair into [delivery_X, pickup_X] and the validator
- * would wave it through because an older committed pickup_X earlier in the
- * route already "set the flag" — yielding a phantom delivery at runtime.
+ * unordered_map is used instead of std::map: average O(1) probe vs O(log K)
+ * tree descent. is_route_valid runs inside the hottest inner loop of 2-Opt.
  */
 bool GraspSolver::is_route_valid(const std::vector<RouteNode>& route) const {
-	std::map<int, int> cargo;
+	std::unordered_map<int, int> cargo;
+	cargo.reserve(route.size());
 	for (const RouteNode& node : route) {
 		if (node.customer_id < 0) continue;
 		if (node.type == RouteNodeType::BAKERY_PICKUP) {
 			cargo[node.customer_id] += node.bread_amount;
 		} else if (node.type == RouteNodeType::CUSTOMER_DELIVERY) {
-			cargo[node.customer_id] -= node.bread_amount;
-			if (cargo[node.customer_id] < 0) return false;
+			int& b = cargo[node.customer_id];
+			b -= node.bread_amount;
+			if (b < 0) return false;
+		}
+	}
+	return true;
+}
+
+/**
+ * @brief Validate the would-be reversed route in-place, without copying.
+ *
+ * The classical 2-Opt accept path used to do:
+ *     candidate = route (O(N) copy)
+ *     reverse [i..j] in candidate (O(N))
+ *     is_route_valid(candidate) (O(N) + map allocations)
+ *     route = move(candidate) (O(N) destruction of old)
+ * which is roughly 4N work per accepted swap. By walking the *original*
+ * route with a virtual mirror index inside [i..j] we get the same validation
+ * for one O(N) pass and no allocation. After the cheap check, the caller
+ * does a single in-place std::reverse — total 2N instead of 4N + heap churn.
+ */
+bool GraspSolver::is_route_valid_after_reverse(
+	const std::vector<RouteNode>& route, std::size_t i, std::size_t j) const
+{
+	std::unordered_map<int, int> cargo;
+	cargo.reserve(route.size());
+	for (std::size_t k = 0; k < route.size(); ++k) {
+		const std::size_t src = (k >= i && k <= j) ? (i + j - k) : k;
+		const RouteNode& node = route[src];
+		if (node.customer_id < 0) continue;
+		if (node.type == RouteNodeType::BAKERY_PICKUP) {
+			cargo[node.customer_id] += node.bread_amount;
+		} else if (node.type == RouteNodeType::CUSTOMER_DELIVERY) {
+			int& b = cargo[node.customer_id];
+			b -= node.bread_amount;
+			if (b < 0) return false;
 		}
 	}
 	return true;
@@ -302,14 +357,17 @@ bool GraspSolver::is_route_valid(const std::vector<RouteNode>& route) const {
  * Each candidate reversal must (a) preserve cargo balance and (b) strictly
  * improve total distance by more than kTwoOptEpsilon.
  *
- * Optimisation: the distance delta of reversing route[i..j] is computed in
- * O(1) directly from the four boundary edges, with no vector allocation, no
- * deep copy, and no recomputation of the unchanged interior. The interior
+ * Probe optimisation: the distance delta of reversing route[i..j] is computed
+ * in O(1) directly from the four boundary edges, with no vector allocation,
+ * no deep copy, and no recomputation of the unchanged interior. The interior
  * edges of a reversed segment have the SAME total length as before because
  * hybrid_distance is symmetric (see distance.cpp::fill_symmetric_matrix), so
- * they cancel out in the delta. Only when the delta proves the new route is
- * shorter do we allocate a candidate, perform the reverse(), and pay for
- * is_route_valid — collapsing the hot path from O(N) per (i,j) probe to O(1).
+ * they cancel out in the delta.
+ *
+ * Accept optimisation: only when the delta proves the new route is shorter
+ * do we pay for cargo-balance validation. The validator inspects the route
+ * with a virtual mirror index inside [i..j] — no copy, no allocation — and
+ * the actual mutation is a single in-place std::reverse.
  *
  * PRECONDITION: @p route is cargo-balance-valid on entry.
  */
@@ -361,17 +419,16 @@ void GraspSolver::apply_two_opt(std::vector<RouteNode>& route,
 				const double delta = d_new - d_old;
 				if (delta >= -kTwoOptEpsilon) continue;  // not a strict improvement
 
-				// Math says this reversal saves distance. Only NOW do we
-				// pay the O(N) costs: copy, reverse, validate cargo-balance.
-				std::vector<RouteNode> candidate = route;
-				std::reverse(candidate.begin() + i, candidate.begin() + j + 1);
-				if (!is_route_valid(candidate)) continue;
+				// Math says the reversal saves distance. Validate cargo
+				// balance over the virtual mirror — no copy, no allocation.
+				if (!is_route_valid_after_reverse(route, i, j)) continue;
 
-				route    = std::move(candidate);
+				// Validation passed: mutate in-place.
+				std::reverse(route.begin() + i, route.begin() + j + 1);
 				improved = true;
 				// Continue scanning within the same pass — matches the
-				// original "many accepts per pass" descent. Subsequent
-				// iterations refetch route[*] above and see the new state.
+				// "many accepts per pass" descent. Subsequent iterations
+				// refetch route[*] above and see the new state.
 			}
 		}
 	}
@@ -400,14 +457,19 @@ GraspSolution GraspSolver::run_single_iteration(
 	const std::vector<Drone>& drones,
 	const std::vector<Bakery>& bakeries,
 	const Position& base_pos,
-	const DistanceCache& dist_cache,
 	std::mt19937& rng)
 {
-	cache = &dist_cache;
-
 	GraspSolution solution;
 	std::vector<Drone>  local_drones   = drones;
 	std::vector<Bakery> local_bakeries = bakeries;
+
+	// Accumulate (priority * fulfilment_ratio) across all served customers so
+	// that, at the end of the iteration, we can divide by the FINAL post-2-Opt
+	// total route time. This is the quantity that drives cross-iteration
+	// selection in stage2_3_assignment — not the pre-2-Opt per-intent score,
+	// which is frozen at candidate-selection time and cannot see the
+	// improvements 2-Opt actually delivered.
+	double total_value = 0.0;
 
 	for (const Customer& customer : customers) {
 		std::vector<Candidate> candidates =
@@ -423,6 +485,10 @@ GraspSolution GraspSolver::run_single_iteration(
 
 		Drone&  assigned      = local_drones[chosen.drone_idx];
 		Bakery& chosen_bakery = local_bakeries[chosen.bakery_id];
+
+		const double ratio = static_cast<double>(chosen.amount) /
+		                     static_cast<double>(std::max(customer.order_quantity, 1));
+		total_value += customer.priority_weight * ratio;
 
 		solution.intents.push_back(
 			{assigned.id, chosen.bakery_id, chosen.amount, customer.id, chosen.score});
@@ -441,14 +507,15 @@ GraspSolution GraspSolver::run_single_iteration(
 		              assigned.current_pos, drone_start_node(assigned));
 	}
 
+	// Final fleet-wide route time AFTER every 2-Opt pass has converged.
+	double total_time = 0.0;
+	for (const Drone& d : local_drones) {
+		total_time += compute_route_time(d, base_pos);
+	}
+	solution.final_score = total_value / std::max(total_time, kMinRouteDeltaT);
+
 	for (const Drone& d : local_drones) {
 		solution.drone_routes[d.id] = d.planned_route;
 	}
 	return solution;
-}
-
-double GraspSolver::evaluate_solution(const std::vector<Intent>& intents) {
-	double total = 0.0;
-	for (const Intent& i : intents) total += i.original_score;
-	return total;
 }

@@ -9,8 +9,9 @@
  *
  * Built once during Simulation::initialize and never mutated afterwards.
  * The base is always the last node so its index is @c node_count - 1.
- * Callers without a precomputed node id may use @c hybrid_distance or
- * @c compute_distance for an on-the-fly Euclidean fallback.
+ *
+ * Storage is a flat row-major vector<double>: one allocation, contiguous,
+ * L1-friendly for sequential row sweeps (the hot path in path_distance).
  */
 class DeliveryGraph {
 public:
@@ -31,7 +32,7 @@ public:
 	int get_base_node()  const noexcept { return node_count - 1; }
 
 private:
-	std::vector<std::vector<double>> adjacency_matrix;
+	std::vector<double> adjacency_matrix;   ///< row-major, size n*n
 	int node_count = 0;
 };
 
@@ -42,6 +43,10 @@ private:
  * active customer, every drone's current position, and the base. Built once
  * on the main thread before parallel GRASP dispatches, so worker threads
  * never recompute Euclidean distances inside the iteration loop.
+ *
+ * Single contiguous matrix instead of vector<vector<double>> — eliminates the
+ * pointer-chase per row and keeps the entire table inside L1 for typical
+ * round sizes (~30 entities × 8 B = 7.2 KB).
  */
 class DistanceCache {
 public:
@@ -52,7 +57,9 @@ public:
 	           const Position& base_pos);
 
 	/// O(1) matrix lookup; caller must pass valid node indices.
-	double dist(int a, int b) const noexcept { return matrix[a][b]; }
+	double dist(int a, int b) const noexcept {
+		return matrix[static_cast<std::size_t>(a) * node_count + b];
+	}
 
 	int bakery_node(int bakery_id) const;
 	int customer_node(int customer_id) const;
@@ -64,10 +71,10 @@ public:
 	              const Position& b, int node_b) const;
 
 private:
-	std::vector<std::vector<double>> matrix;
-	std::unordered_map<int, int>     bakery_to_idx;
-	std::unordered_map<int, int>     customer_to_idx;
-	std::unordered_map<int, int>     drone_to_idx;
+	std::vector<double>          matrix;    ///< row-major, size n*n
+	std::unordered_map<int, int> bakery_to_idx;
+	std::unordered_map<int, int> customer_to_idx;
+	std::unordered_map<int, int> drone_to_idx;
 	int base_idx   = -1;
 	int node_count = 0;
 };

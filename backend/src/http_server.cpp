@@ -88,15 +88,54 @@ void HttpServer::run_server() {
 }
 
 void HttpServer::handle_client(int client_fd) {
-	char buffer[8192];
-	std::memset(buffer, 0, sizeof(buffer));
-	const ssize_t bytes = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
-	if (bytes <= 0) {
-		close(client_fd);
-		return;
+	// Read until end-of-headers, then keep reading until the body satisfies
+	// Content-Length. A single recv() can return less than the full request
+	// when the client splits the message across TCP segments — the old
+	// "one recv, hope for the best" path truncates such requests silently.
+	static constexpr std::size_t kMaxRequest = 16 * 1024 * 1024;   // 16 MB sanity cap
+	std::string request;
+	char chunk[4096];
+
+	auto find_header_end = [&request]() {
+		return request.find("\r\n\r\n");
+	};
+
+	std::size_t header_end = std::string::npos;
+	while (header_end == std::string::npos) {
+		const ssize_t n = recv(client_fd, chunk, sizeof(chunk), 0);
+		if (n <= 0) { close(client_fd); return; }
+		request.append(chunk, n);
+		header_end = find_header_end();
+		if (request.size() > kMaxRequest) { close(client_fd); return; }
 	}
 
-	const std::string request(buffer, bytes);
+	// Parse Content-Length (case-sensitive — most clients send "Content-Length:").
+	std::size_t content_length = 0;
+	{
+		const std::string headers = request.substr(0, header_end);
+		const std::string key     = "Content-Length:";
+		auto pos = headers.find(key);
+		if (pos != std::string::npos) {
+			pos += key.size();
+			while (pos < headers.size() &&
+			       (headers[pos] == ' ' || headers[pos] == '\t')) ++pos;
+			std::size_t end = pos;
+			while (end < headers.size() && headers[end] >= '0' && headers[end] <= '9') ++end;
+			if (end > pos) {
+				try { content_length = std::stoul(headers.substr(pos, end - pos)); }
+				catch (...) { content_length = 0; }
+			}
+		}
+	}
+
+	const std::size_t body_start  = header_end + 4;
+	const std::size_t want_total  = body_start + content_length;
+	while (request.size() < want_total && request.size() < kMaxRequest) {
+		const ssize_t n = recv(client_fd, chunk, sizeof(chunk), 0);
+		if (n <= 0) break;   // client closed; process what we have
+		request.append(chunk, n);
+	}
+
 	const std::string method = parse_method(request);
 	const std::string path   = parse_path(request);
 	const std::string body   = parse_body(request);
@@ -243,7 +282,9 @@ std::string HttpServer::handle_remove_customer(const std::string& body) {
 }
 
 std::string HttpServer::handle_initialize() {
-	sim.initialize();
+	// initialize() is idempotent ONLY after a reset() — calling it directly
+	// would append a second copy of every bakery, drone, and customer.
+	sim.reset();
 	return handle_get_state();
 }
 

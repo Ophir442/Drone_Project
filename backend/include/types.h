@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cmath>
+#include <cstdint>
 #include <string>
 #include <utility>
 #include <vector>
@@ -152,4 +153,9 @@ struct SimConfig {
 	DroneTemplate drone_template;
 	std::vector<BakeryConfig> bakery_configs;
 	std::vector<CustomerConfig> customer_configs;
+
+	/// If @c deterministic is true, the simulation seeds its master mt19937
+	/// from @c seed instead of /dev/urandom. Required for reproducible runs.
+	std::uint64_t seed = 0;
+	bool          deterministic = false;
 };

@@ -18,6 +18,10 @@ struct BakeryAssignment {
 struct GraspSolution {
 	std::vector<Intent>                   intents;
 	std::map<int, std::vector<RouteNode>> drone_routes;
+	/// Aggregate post-2-Opt score: total delivered "value" divided by total
+	/// fleet route time. Captures 2-Opt improvements that the per-intent
+	/// original_score (frozen at candidate-selection time) cannot.
+	double                                final_score = 0.0;
 };
 
 /**
@@ -29,18 +33,26 @@ struct GraspSolution {
  * assignment space; the best-scoring solution wins.
  *
  * The solver is thread-safe given per-thread snapshots of @c drones and
- * @c bakeries plus a per-thread @c std::mt19937. The @c DistanceCache is
- * shared read-only across threads.
+ * @c bakeries plus a per-thread @c std::mt19937. The @c DistanceCache passed
+ * to the constructor is shared read-only across threads.
  */
 class GraspSolver {
 public:
 	/**
-	 * @brief Construct a solver bound to a static delivery graph.
+	 * @brief Construct a solver bound to a static graph and a per-round cache.
+	 *
 	 * @param graph      static bakery+base distance graph (read-only).
 	 * @param rcl_size   maximum size of the Restricted Candidate List per customer.
 	 * @param iterations total iterations to run across all threads (informational).
+	 * @param cache      per-round distance cache; must outlive the solver.
+	 *
+	 * Storing the cache as a const reference (rather than a mutable pointer set
+	 * by run_single_iteration) makes the solver a pure functor: no method
+	 * mutates state across calls, so the same solver is safe to reuse across
+	 * iterations without re-construction.
 	 */
-	GraspSolver(const DeliveryGraph& graph, int rcl_size, int iterations);
+	GraspSolver(const DeliveryGraph& graph, int rcl_size, int iterations,
+	            const DistanceCache& cache);
 
 	/**
 	 * @brief Build one feasible solution and improve it with 2-Opt.
@@ -52,7 +64,6 @@ public:
 	 * @param drones    per-thread snapshot of the fleet.
 	 * @param bakeries  per-thread snapshot of inventory levels.
 	 * @param base_pos  depot position used for return-leg time estimation.
-	 * @param cache     shared per-round distance cache (read-only).
 	 * @param rng       thread-local Mersenne Twister.
 	 */
 	GraspSolution run_single_iteration(
@@ -60,11 +71,7 @@ public:
 		const std::vector<Drone>& drones,
 		const std::vector<Bakery>& bakeries,
 		const Position& base_pos,
-		const DistanceCache& cache,
 		std::mt19937& rng);
-
-	/// Sum of per-intent original_scores; higher = better assignment.
-	static double evaluate_solution(const std::vector<Intent>& intents);
 
 private:
 	/// A single (drone, bakery, amount) option for one customer.
@@ -76,9 +83,9 @@ private:
 	};
 
 	const DeliveryGraph& graph;
-	int rcl_size;
-	int iterations;
-	const DistanceCache* cache = nullptr;
+	int                  rcl_size;
+	int                  iterations;
+	const DistanceCache& cache;
 
 	// ---- distance helpers ----
 	double distance_between(const Position& a, int a_node,
@@ -112,4 +119,7 @@ private:
 	void apply_two_opt(std::vector<RouteNode>& route,
 	                   const Position& start_pos, int start_node) const;
 	bool is_route_valid(const std::vector<RouteNode>& route) const;
+	bool is_route_valid_after_reverse(
+		const std::vector<RouteNode>& route,
+		std::size_t i, std::size_t j) const;
 };

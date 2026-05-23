@@ -5,9 +5,8 @@
 #include "thread_pool.h"
 #include "types.h"
 #include <memory>
-#include <queue>
 #include <random>
-#include <set>
+#include <unordered_set>
 #include <vector>
 
 /**
@@ -29,8 +28,13 @@
  *     — and emits the actual allocation. Only allocations that survive
  *     contention are written to drone routes.
  *
- * All mutation of the customer priority_queue and the assigned-id sets
- * happens on the main thread so the priority_queue stays single-writer.
+ * Customers live in a flat vector; in-place bookkeeping (priority bumps,
+ * delivery debits) is O(n) instead of the O(n log n) drain-and-rebuild that
+ * a std::priority_queue forces. GRASP sorts a one-shot snapshot per round
+ * for its priority-order pass.
+ *
+ * All mutation of the customer vector and the assigned-id sets happens on
+ * the main thread.
  */
 class Simulation {
 public:
@@ -58,9 +62,9 @@ public:
 	void remove_customer(int customer_id);
 
 	// ---- snapshots (read-only views for the HTTP layer) ----
-	const std::vector<Bakery>& get_bakeries() const { return bakeries; }
-	const std::vector<Drone>&  get_drones()   const { return drones; }
-	std::vector<Customer>      get_all_customers() const;
+	const std::vector<Bakery>&   get_bakeries() const { return bakeries; }
+	const std::vector<Drone>&    get_drones()   const { return drones; }
+	const std::vector<Customer>& get_all_customers() const { return customer_queue; }
 	int get_round() const { return current_round; }
 	const SimConfig& get_config() const { return config; }
 	const Position&  get_base_pos() const { return config.base_pos; }
@@ -72,7 +76,7 @@ private:
 	SimConfig config;
 
 	std::vector<Bakery>            bakeries;
-	std::priority_queue<Customer>  customer_queue;
+	std::vector<Customer>          customer_queue;   ///< flat, unsorted; GRASP sorts per round
 	std::vector<Drone>             drones;
 	DeliveryGraph                  delivery_graph;
 
@@ -85,9 +89,9 @@ private:
 	int total_bread_delivered;
 	int total_customers_served;
 
-	std::vector<Intent> last_resolved_intents;
-	std::set<int>       assigned_customer_ids;
-	std::set<int>       served_this_round;
+	std::vector<Intent>      last_resolved_intents;
+	std::unordered_set<int>  assigned_customer_ids;
+	std::unordered_set<int>  served_this_round;
 
 	// ---- validation ----
 	void validate_config() const;
@@ -108,6 +112,6 @@ private:
 	Drone* find_drone(int id);
 
 	// ---- idle repositioning ----
-	void          reposition_idle_drones(const std::set<int>& assigned_drone_ids);
+	void          reposition_idle_drones(const std::unordered_set<int>& assigned_drone_ids);
 	const Bakery* choose_repositioning_target(const Drone& drone) const;
 };

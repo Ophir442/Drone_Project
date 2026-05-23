@@ -1,11 +1,11 @@
 /**
  * @file distance.cpp
- * @brief Symmetric Euclidean matrices for the simulation's two distance views.
+ * @brief Flat row-major symmetric Euclidean matrices.
  *
- * DeliveryGraph is a small per-run matrix (bakeries + base). DistanceCache is
- * a per-round superset that also includes the active customer set and the
- * current drone positions, so GRASP workers can resolve any pair via a flat
- * table lookup rather than an on-the-fly sqrt.
+ * Both DeliveryGraph and DistanceCache use a single contiguous
+ * vector<double> sized n*n. This eliminates the vector<vector<double>>
+ * pointer-chase per row and keeps the whole table inside L1 for typical
+ * round sizes.
  */
 
 #include "distance.h"
@@ -14,18 +14,21 @@
 
 namespace {
 
-/// Fill a symmetric n×n Euclidean matrix from @p positions. Diagonal is 0.
+/// Fill a symmetric n×n Euclidean matrix from @p positions, row-major.
+/// Diagonal is 0. Sets @p n_out to the side length.
 void fill_symmetric_matrix(const std::vector<Position>& positions,
-                           std::vector<std::vector<double>>& matrix) {
+                           std::vector<double>& matrix,
+                           int& n_out) {
 	const int n = static_cast<int>(positions.size());
-	matrix.assign(n, std::vector<double>(n, 0.0));
+	matrix.assign(static_cast<std::size_t>(n) * n, 0.0);
 	for (int i = 0; i < n; ++i) {
 		for (int j = i + 1; j < n; ++j) {
 			const double d = positions[i].distance_to(positions[j]);
-			matrix[i][j] = d;
-			matrix[j][i] = d;
+			matrix[static_cast<std::size_t>(i) * n + j] = d;
+			matrix[static_cast<std::size_t>(j) * n + i] = d;
 		}
 	}
+	n_out = n;
 }
 
 }  // namespace
@@ -40,14 +43,13 @@ void DeliveryGraph::initialize(const std::vector<Bakery>& bakeries,
 	for (const auto& b : bakeries) positions.push_back(b.pos);
 	positions.push_back(base_pos);  // base is always the last node
 
-	fill_symmetric_matrix(positions, adjacency_matrix);
-	node_count = static_cast<int>(positions.size());
+	fill_symmetric_matrix(positions, adjacency_matrix, node_count);
 }
 
 double DeliveryGraph::get_static_distance(int from_node, int to_node) const {
 	assert(from_node >= 0 && from_node < node_count);
 	assert(to_node   >= 0 && to_node   < node_count);
-	return adjacency_matrix[from_node][to_node];
+	return adjacency_matrix[static_cast<std::size_t>(from_node) * node_count + to_node];
 }
 
 double DeliveryGraph::compute_distance(const Position& a, const Position& b) {
@@ -57,7 +59,7 @@ double DeliveryGraph::compute_distance(const Position& a, const Position& b) {
 double DeliveryGraph::hybrid_distance(const Position& a, int a_node,
                                       const Position& b, int b_node) const {
 	if (a_node >= 0 && b_node >= 0 && a_node < node_count && b_node < node_count) {
-		return adjacency_matrix[a_node][b_node];
+		return adjacency_matrix[static_cast<std::size_t>(a_node) * node_count + b_node];
 	}
 	return a.distance_to(b);
 }
@@ -88,8 +90,7 @@ void DistanceCache::build(const std::vector<Bakery>& bakeries,
 	base_idx = static_cast<int>(positions.size());
 	positions.push_back(base_pos);
 
-	fill_symmetric_matrix(positions, matrix);
-	node_count = static_cast<int>(positions.size());
+	fill_symmetric_matrix(positions, matrix, node_count);
 }
 
 int DistanceCache::bakery_node(int bakery_id) const {
@@ -110,7 +111,7 @@ int DistanceCache::drone_node(int drone_id) const {
 double DistanceCache::lookup(const Position& a, int node_a,
                              const Position& b, int node_b) const {
 	if (node_a >= 0 && node_b >= 0 && node_a < node_count && node_b < node_count) {
-		return matrix[node_a][node_b];
+		return matrix[static_cast<std::size_t>(node_a) * node_count + node_b];
 	}
 	return a.distance_to(b);
 }
