@@ -402,31 +402,34 @@ Drone Simulation::spawn_drone() {
  * the GRASP score.
  */
 bool Simulation::should_spawn_drone() const {
-	double D_demand = 0.0;
+	// Bread, demand, and capacity are all counts of whole loaves — model them
+	// as int. Using double here invited needless float widening on every add
+	// and a fuzzy `> 0.0` test on a quantity that is exactly integral.
+	int D_demand = 0;
 	for (const Customer& c : customer_queue) {
 		assert(c.order_quantity >= 0);
 		if (assigned_customer_ids.count(c.id)) continue;
 		D_demand += c.order_quantity;
 	}
 
-	double B_supply = 0.0;
+	int B_supply = 0;
 	for (const Bakery& b : bakeries) {
 		assert(b.current_inventory >= 0);
 		assert(b.current_inventory <= b.capacity);
 		B_supply += b.current_inventory;
 	}
 
-	double C_fleet = 0.0;
+	int C_fleet = 0;
 	for (const Drone& d : drones) {
 		assert(d.max_capacity > 0);
 		C_fleet += d.max_capacity;
 	}
 
-	assert(D_demand >= 0.0);
-	assert(B_supply >= 0.0);
-	assert(C_fleet >= 0.0);
+	assert(D_demand >= 0);
+	assert(B_supply >= 0);
+	assert(C_fleet >= 0);
 
-	return (B_supply > 0.0) && (C_fleet < D_demand);
+	return (B_supply > 0) && (C_fleet < D_demand);
 }
 
 void Simulation::maybe_spawn_drone() {

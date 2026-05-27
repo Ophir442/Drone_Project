@@ -32,9 +32,10 @@ struct GraspSolution {
  * 2-Opt. Multiple iterations explore different neighborhoods of the
  * assignment space; the best-scoring solution wins.
  *
- * The solver is thread-safe given per-thread snapshots of @c drones and
- * @c bakeries plus a per-thread @c std::mt19937. The @c DistanceCache passed
- * to the constructor is shared read-only across threads.
+ * The solver is thread-safe: @c drones and @c bakeries are read-only and may
+ * be shared across threads, each iteration mutates only its own local scratch
+ * buffers, and each thread supplies its own @c std::mt19937. The
+ * @c DistanceCache passed to the constructor is likewise shared read-only.
  */
 class GraspSolver {
 public:
@@ -57,12 +58,18 @@ public:
 	/**
 	 * @brief Build one feasible solution and improve it with 2-Opt.
 	 *
-	 * Operates on private snapshots of @p drones and @p bakeries — the
-	 * caller is responsible for cloning state per worker thread.
+	 * Data-oriented design: @p drones and @p bakeries are read-only const
+	 * references shared across all worker threads — only their immutable
+	 * fields (positions, capacities, velocities, ids, existing committed
+	 * routes) are read. All per-iteration mutation lives in three lightweight
+	 * primitive scratch buffers allocated inside the call (bakery inventory,
+	 * per-drone evolving routes, per-drone cargo). No Drone or Bakery struct
+	 * is ever deep-copied, so the parallel allocator is never contended on the
+	 * inner vectors/strings those structs carry.
 	 *
 	 * @param customers active (unassigned) customer set, max-priority first.
-	 * @param drones    per-thread snapshot of the fleet.
-	 * @param bakeries  per-thread snapshot of inventory levels.
+	 * @param drones    shared read-only fleet (positions/capacities/routes).
+	 * @param bakeries  shared read-only bakery set (positions/capacities).
 	 * @param base_pos  depot position used for return-leg time estimation.
 	 * @param rng       thread-local Mersenne Twister.
 	 */
@@ -95,24 +102,36 @@ private:
 	int base_node_id() const;
 
 	// ---- route timing ----
+	// Routes are passed in explicitly (the drone's *local* evolving route),
+	// not read from Drone::planned_route, so timing reflects the in-progress
+	// scratch plan rather than the shared read-only fleet state.
 	double path_distance(const Position& start_pos, int start_node,
 	                     const std::vector<RouteNode>& route, std::size_t start_idx,
 	                     const Position* end_pos = nullptr, int end_node = -1) const;
-	double compute_route_time(const Drone& drone, const Position& base_pos) const;
+	double compute_route_time(const Drone& drone,
+	                          const std::vector<RouteNode>& route,
+	                          const Position& base_pos) const;
 	double compute_route_time_with_assignment(
-		const Drone& drone, const Bakery& bakery,
-		const Customer& customer, int amount,
+		const Drone& drone, const std::vector<RouteNode>& route,
+		const Bakery& bakery, const Customer& customer, int amount,
 		const Position& base_pos) const;
 
 	// ---- selection ----
+	// Bakery stock is read from @p inventory (the local scratch buffer, indexed
+	// by bakery id), never from Bakery::current_inventory — the Bakery objects
+	// are shared read-only and carry only positions/capacities here.
 	BakeryAssignment find_best_bakery(
-		const Drone& drone, const Customer& customer,
-		const std::vector<Bakery>& bakeries, const Position& base_pos) const;
+		const Drone& drone, const std::vector<RouteNode>& route,
+		const Customer& customer, const std::vector<Bakery>& bakeries,
+		const std::vector<int>& inventory, const Position& base_pos) const;
 
 	std::vector<Candidate> build_candidates(
 		const Customer& customer,
 		const std::vector<Drone>& drones,
+		const std::vector<std::vector<RouteNode>>& local_routes,
+		const std::vector<int>& local_drone_loads,
 		const std::vector<Bakery>& bakeries,
+		const std::vector<int>& local_inventory,
 		const Position& base_pos) const;
 
 	// ---- 2-opt ----

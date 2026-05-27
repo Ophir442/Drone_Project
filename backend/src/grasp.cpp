@@ -102,14 +102,17 @@ double GraspSolver::path_distance(
 	return total;
 }
 
-/// Estimated time-to-complete for a drone's *current* plan plus a return-to-base hop.
+/// Estimated time-to-complete for @p route (the drone's local scratch plan)
+/// plus a return-to-base hop. The route is supplied explicitly rather than read
+/// from drone.planned_route so the timing reflects the in-progress local plan.
 double GraspSolver::compute_route_time(const Drone& drone,
+                                       const std::vector<RouteNode>& route,
                                        const Position& base_pos) const {
-	if (drone.planned_route.empty()) return 0.0;
+	if (route.empty()) return 0.0;
 	assert(drone.velocity > 0.0);
 	const double d = path_distance(
 		drone.current_pos, drone_start_node(drone),
-		drone.planned_route, drone.route_progress,
+		route, drone.route_progress,
 		&base_pos, base_node_id());
 	return d / drone.velocity;
 }
@@ -123,7 +126,8 @@ double GraspSolver::compute_route_time(const Drone& drone,
 /// add three closed-form edges (last -> bakery -> customer -> base). Same
 /// answer; no per-candidate vector construction.
 double GraspSolver::compute_route_time_with_assignment(
-	const Drone& drone, const Bakery& bakery, const Customer& customer,
+	const Drone& drone, const std::vector<RouteNode>& route,
+	const Bakery& bakery, const Customer& customer,
 	int amount, const Position& base_pos) const
 {
 	assert(drone.velocity > 0.0);
@@ -140,8 +144,8 @@ double GraspSolver::compute_route_time_with_assignment(
 	double   existing = 0.0;
 
 	const bool has_tail =
-		!drone.planned_route.empty() &&
-		drone.route_progress < static_cast<int>(drone.planned_route.size());
+		!route.empty() &&
+		drone.route_progress < static_cast<int>(route.size());
 
 	if (!has_tail) {
 		last_pos  = drone.current_pos;
@@ -149,10 +153,10 @@ double GraspSolver::compute_route_time_with_assignment(
 	} else {
 		existing = path_distance(
 			drone.current_pos, drone_start_node(drone),
-			drone.planned_route, drone.route_progress,
+			route, drone.route_progress,
 			/*end_pos*/  nullptr,
 			/*end_node*/ -1);
-		const RouteNode& tail = drone.planned_route.back();
+		const RouteNode& tail = route.back();
 		last_pos  = tail.pos;
 		last_node = node_id_for(tail);
 	}
@@ -183,16 +187,17 @@ double GraspSolver::compute_route_time_with_assignment(
  * visit to the chosen bakery (i.e. ≤ current_inventory and ≤ capacity).
  */
 BakeryAssignment GraspSolver::find_best_bakery(
-	const Drone& drone, const Customer& customer,
-	const std::vector<Bakery>& bakeries, const Position& base_pos) const
+	const Drone& drone, const std::vector<RouteNode>& route,
+	const Customer& customer, const std::vector<Bakery>& bakeries,
+	const std::vector<int>& inventory, const Position& base_pos) const
 {
 	BakeryAssignment best{-1, 0};
 	double best_time = std::numeric_limits<double>::max();
 
 	for (const Bakery& b : bakeries) {
-		if (b.current_inventory < customer.order_quantity) continue;
+		if (inventory[b.id] < customer.order_quantity) continue;
 		const double t = compute_route_time_with_assignment(
-			drone, b, customer, customer.order_quantity, base_pos);
+			drone, route, b, customer, customer.order_quantity, base_pos);
 		if (t < best_time) {
 			best_time = t;
 			best.bakery_id = b.id;
@@ -203,10 +208,10 @@ BakeryAssignment GraspSolver::find_best_bakery(
 	if (best.bakery_id == -1) {
 		int max_inv = 0;
 		for (const Bakery& b : bakeries) {
-			if (b.current_inventory > max_inv) {
-				max_inv = b.current_inventory;
+			if (inventory[b.id] > max_inv) {
+				max_inv = inventory[b.id];
 				best.bakery_id = b.id;
-				best.achievable_amount = b.current_inventory;
+				best.achievable_amount = inventory[b.id];
 			}
 		}
 	}
@@ -214,7 +219,7 @@ BakeryAssignment GraspSolver::find_best_bakery(
 	if (best.bakery_id >= 0) {
 		const Bakery& b = bakeries[best.bakery_id];
 		assert(best.achievable_amount >= 0);
-		assert(best.achievable_amount <= b.current_inventory);
+		assert(best.achievable_amount <= inventory[best.bakery_id]);
 		assert(best.achievable_amount <= b.capacity);
 	}
 	return best;
@@ -235,19 +240,29 @@ BakeryAssignment GraspSolver::find_best_bakery(
 std::vector<GraspSolver::Candidate> GraspSolver::build_candidates(
 	const Customer& customer,
 	const std::vector<Drone>& drones,
+	const std::vector<std::vector<RouteNode>>& local_routes,
+	const std::vector<int>& local_drone_loads,
 	const std::vector<Bakery>& bakeries,
+	const std::vector<int>& local_inventory,
 	const Position& base_pos) const
 {
 	std::vector<Candidate> out;
 	out.reserve(drones.size());
 
 	for (std::size_t d = 0; d < drones.size(); ++d) {
-		const Drone& drone = drones[d];
+		const Drone&                  drone = drones[d];
+		const std::vector<RouteNode>& route = local_routes[d];
 
-		const BakeryAssignment ba = find_best_bakery(drone, customer, bakeries, base_pos);
+		const BakeryAssignment ba =
+			find_best_bakery(drone, route, customer, bakeries, local_inventory, base_pos);
 		if (ba.bakery_id < 0 || ba.achievable_amount <= 0) continue;
 
 		const Bakery& bakery = bakeries[ba.bakery_id];
+
+		// Free capacity is read O(1) from the local cargo buffer (current load
+		// plus every pickup already planned this iteration), not by re-walking
+		// the route per candidate as future_load() once did.
+		const int free_capacity = drone.max_capacity - local_drone_loads[d];
 
 		// Defensive triple-clamp on the single-visit pickup amount:
 		//   - achievable_amount : what find_best_bakery already vetted
@@ -255,24 +270,24 @@ std::vector<GraspSolver::Candidate> GraspSolver::build_candidates(
 		//                         blocks the "Giant-Drone" deadlock where a
 		//                         drone would wait for bread the bakery is
 		//                         physically incapable of producing in stock
-		//   - drone free cap    : remaining payload on this drone
+		//   - free_capacity     : remaining payload on this drone
 		// Whatever the customer still needs after this pickup will be served
 		// by a subsequent round's GRASP iteration (order splitting).
 		const int amount_to_take = std::min({
 			ba.achievable_amount,
 			bakery.capacity,
-			drone.max_capacity - future_load(drone)
+			free_capacity
 		});
 		if (amount_to_take <= 0) continue;
 
 		assert(amount_to_take > 0);
 		assert(amount_to_take <= bakery.capacity);
-		assert(amount_to_take <= bakery.current_inventory);
-		assert(amount_to_take <= drone.max_capacity - future_load(drone));
+		assert(amount_to_take <= local_inventory[ba.bakery_id]);
+		assert(amount_to_take <= free_capacity);
 
 		const double t_with    = compute_route_time_with_assignment(
-			drone, bakery, customer, amount_to_take, base_pos);
-		const double t_without = compute_route_time(drone, base_pos);
+			drone, route, bakery, customer, amount_to_take, base_pos);
+		const double t_without = compute_route_time(drone, route, base_pos);
 		const double dt        = std::max(t_with - t_without, kMinRouteDeltaT);
 
 		const double ratio = static_cast<double>(amount_to_take) /
@@ -438,14 +453,33 @@ void GraspSolver::apply_two_opt(std::vector<RouteNode>& route,
 /* ---------- main GRASP loop ---------- */
 
 /**
- * @brief Run one GRASP iteration end-to-end on private state snapshots.
+ * @brief Run one GRASP iteration end-to-end on lightweight local scratch state.
+ *
+ * Data-oriented design: the shared @p drones and @p bakeries vectors are never
+ * deep-copied. Their immutable fields (positions, capacities, velocities, ids,
+ * existing committed routes) are read directly through const references; all
+ * mutation is confined to three flat per-iteration buffers:
+ *
+ *   - local_inventory[bakery_id] : changing bread stock, seeded from the shared
+ *                                  inventory and decremented as orders are sourced.
+ *   - local_routes[drone_idx]    : the evolving plan per drone, seeded from the
+ *                                  drone's existing committed route, then extended
+ *                                  and 2-Opt'd.
+ *   - local_drone_loads[drone_idx] : current committed cargo (load + planned
+ *                                  pickups), kept in sync so free capacity is O(1).
+ *
+ * This eliminates the per-iteration deep copy of the Drone / Bakery structs and
+ * the inner vectors they carry (planned_route, pending_deliveries,
+ * production_distribution) — the dominant allocator-contention source when many
+ * iterations run in parallel.
  *
  * For each customer in priority order:
  *   - build candidates (per-drone, per-bakery, with order-splitting),
  *   - sort by score descending,
  *   - sample uniformly from the top-K = Restricted Candidate List,
- *   - extend the chosen drone's route with the pickup/delivery pair,
- *   - decrement the local bakery snapshot (so later customers see post-state),
+ *   - extend the chosen drone's local route with the pickup/delivery pair,
+ *   - decrement local_inventory (so later customers see post-state),
+ *   - bump local_drone_loads by the pickup amount,
  *   - improve the route with 2-Opt over the mutable suffix.
  *
  * The "GR" in GRASP is exactly the RCL sampling step: pure greedy would
@@ -460,8 +494,25 @@ GraspSolution GraspSolver::run_single_iteration(
 	std::mt19937& rng)
 {
 	GraspSolution solution;
-	std::vector<Drone>  local_drones   = drones;
-	std::vector<Bakery> local_bakeries = bakeries;
+
+	const std::size_t num_bakeries = bakeries.size();
+	const std::size_t num_drones   = drones.size();
+
+	// --- lightweight mutable scratch state (no struct deep copies) ---
+	std::vector<int> local_inventory(num_bakeries);
+	for (const Bakery& b : bakeries) {
+		local_inventory[b.id] = b.current_inventory;
+	}
+
+	std::vector<std::vector<RouteNode>> local_routes(num_drones);
+	std::vector<int>                    local_drone_loads(num_drones);
+	for (std::size_t d = 0; d < num_drones; ++d) {
+		// Seed each drone's scratch route from its existing committed plan;
+		// future_load folds current cargo + already-planned pickups into the
+		// running cargo counter so build_candidates never re-walks the route.
+		local_routes[d]      = drones[d].planned_route;
+		local_drone_loads[d] = future_load(drones[d]);
+	}
 
 	// Accumulate (priority * fulfilment_ratio) across all served customers so
 	// that, at the end of the iteration, we can divide by the FINAL post-2-Opt
@@ -473,7 +524,8 @@ GraspSolution GraspSolver::run_single_iteration(
 
 	for (const Customer& customer : customers) {
 		std::vector<Candidate> candidates =
-			build_candidates(customer, local_drones, local_bakeries, base_pos);
+			build_candidates(customer, drones, local_routes, local_drone_loads,
+			                 bakeries, local_inventory, base_pos);
 		if (candidates.empty()) continue;
 
 		std::sort(candidates.begin(), candidates.end(),
@@ -483,8 +535,9 @@ GraspSolution GraspSolver::run_single_iteration(
 		const Candidate& chosen =
 			candidates[std::uniform_int_distribution<int>(0, k - 1)(rng)];
 
-		Drone&  assigned      = local_drones[chosen.drone_idx];
-		Bakery& chosen_bakery = local_bakeries[chosen.bakery_id];
+		const Drone&            assigned = drones[chosen.drone_idx];   // read-only
+		std::vector<RouteNode>& route    = local_routes[chosen.drone_idx];
+		const Bakery&           bakery   = bakeries[chosen.bakery_id]; // read-only
 
 		const double ratio = static_cast<double>(chosen.amount) /
 		                     static_cast<double>(std::max(customer.order_quantity, 1));
@@ -493,29 +546,30 @@ GraspSolution GraspSolver::run_single_iteration(
 		solution.intents.push_back(
 			{assigned.id, chosen.bakery_id, chosen.amount, customer.id, chosen.score});
 
-		chosen_bakery.current_inventory =
-			std::max(0, chosen_bakery.current_inventory - chosen.amount);
+		// Mutate only the flat scratch buffers — never the shared structs.
+		local_inventory[chosen.bakery_id] =
+			std::max(0, local_inventory[chosen.bakery_id] - chosen.amount);
+		local_drone_loads[chosen.drone_idx] += chosen.amount;
 
-		assigned.planned_route.push_back(
-			{RouteNodeType::BAKERY_PICKUP, chosen_bakery.pos,
-			 chosen_bakery.id, customer.id, chosen.amount, false});
-		assigned.planned_route.push_back(
+		route.push_back(
+			{RouteNodeType::BAKERY_PICKUP, bakery.pos,
+			 bakery.id, customer.id, chosen.amount, false});
+		route.push_back(
 			{RouteNodeType::CUSTOMER_DELIVERY, customer.pos,
 			 customer.id, customer.id, chosen.amount, false});
 
-		apply_two_opt(assigned.planned_route,
-		              assigned.current_pos, drone_start_node(assigned));
+		apply_two_opt(route, assigned.current_pos, drone_start_node(assigned));
 	}
 
 	// Final fleet-wide route time AFTER every 2-Opt pass has converged.
 	double total_time = 0.0;
-	for (const Drone& d : local_drones) {
-		total_time += compute_route_time(d, base_pos);
+	for (std::size_t d = 0; d < num_drones; ++d) {
+		total_time += compute_route_time(drones[d], local_routes[d], base_pos);
 	}
 	solution.final_score = total_value / std::max(total_time, kMinRouteDeltaT);
 
-	for (const Drone& d : local_drones) {
-		solution.drone_routes[d.id] = d.planned_route;
+	for (std::size_t d = 0; d < num_drones; ++d) {
+		solution.drone_routes[drones[d].id] = std::move(local_routes[d]);
 	}
 	return solution;
 }
